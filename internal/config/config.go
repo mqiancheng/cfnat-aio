@@ -62,6 +62,7 @@ type FOFAKey struct {
 	QuotaTotal int    `json:"quota_total"` // 总配额
 	Enabled    bool   `json:"enabled"`
 	Note       string `json:"note"`
+	CreatedAt  string `json:"created_at"`  // 创建时间
 }
 
 // GeneralConfig 通用配置
