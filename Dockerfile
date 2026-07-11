@@ -22,7 +22,7 @@ RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /out/cfnat-aio ./cmd/server
 FROM alpine:3.19
 
 RUN apk add --no-cache ca-certificates tzdata && \
-    addgroup -S cfnat && adduser -S cfnat -G cfnat
+    addgroup -g 1000 cfnat && adduser -u 1000 -G cfnat -D cfnat
 
 COPY --from=builder /out/cfnat-aio /usr/local/bin/cfnat-aio
 RUN chmod +x /usr/local/bin/cfnat-aio
