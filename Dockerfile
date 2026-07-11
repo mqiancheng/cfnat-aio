@@ -7,16 +7,12 @@ RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /src
 
-# 复制模块定义先（利用 Docker 缓存）
-COPY go.mod go.sum* ./
-RUN go mod download || true
-
-# 复制源码
+# 复制全部源码
 COPY . .
 
-# 静态编译（CGO 关闭也能跑的 sqlite 走纯 Go 驱动会更简单，
-#   但 mattn/go-sqlite3 性能更好，这里保留 CGO 模式）
-RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /out/cfnat-aio ./cmd/server
+# 下载依赖并编译
+RUN CGO_ENABLED=1 go mod tidy && \
+    CGO_ENABLED=1 go build -ldflags="-s -w" -o /out/cfnat-aio ./cmd/server
 
 # 第二阶段：最小运行时镜像
 FROM alpine:3.19
