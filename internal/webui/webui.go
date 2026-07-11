@@ -85,6 +85,8 @@ func (h *Handlers) HandleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-cache, no-store, must-revalidate")
 	data := map[string]interface{}{
 		"General": h.CfgMgr.General(),
 	}
