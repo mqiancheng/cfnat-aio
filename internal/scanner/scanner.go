@@ -30,6 +30,7 @@ import (
 
 	"cfnat-aio/internal/config"
 	"cfnat-aio/internal/iplibrary"
+	"cfnat-aio/internal/logging"
 )
 
 // Scanner 扫描器
@@ -104,29 +105,39 @@ func (s *Scanner) RunOnce() {
 		sc.Interval = 60
 	}
 
+	logging.InfoTo("scanner", "▶ 扫描任务 #%d 启动 (IPv%d, 抽样数=%d/24, 速度阈值=%.1fMB/s)",
+		histID, sc.IPType, sc.SamplesPer24, sc.MinSpeedMBps)
+
 	// 阶段 1: 加载 CIDR 列表
 	cidrs, err := s.loadCIDRs(sc.IPType)
 	if err != nil || len(cidrs) == 0 {
+		logging.ErrorTo("scanner", "✗ 加载 CIDR 列表失败: %v", err)
 		s.finishRun(histID, "error", 0, 0, fmt.Sprintf("加载CIDR失败: %v", err))
 		return
 	}
+	logging.InfoTo("scanner", "  [1/5] 加载 CIDR: %d 段", len(cidrs))
 
 	// 阶段 2: 按 /24 抽样
 	candidates := s.sampleCIDRs(cidrs, sc.SamplesPer24, sc.IPType)
 	if len(candidates) == 0 {
+		logging.ErrorTo("scanner", "✗ 抽样后无候选 IP")
 		s.finishRun(histID, "error", 0, 0, "抽样后候选IP为空")
 		return
 	}
+	logging.InfoTo("scanner", "  [2/5] /24 抽样: %d 个候选 IP", len(candidates))
 
 	// 阶段 3: TCP + TLS 探活 + /cdn-cgi/trace
 	stats := s.probeAndTrace(ctx, candidates, sc)
 	if stats == nil {
+		logging.ErrorTo("scanner", "✗ 探活阶段异常")
 		s.finishRun(histID, "error", len(candidates), 0, "探活阶段异常")
 		return
 	}
+	logging.InfoTo("scanner", "  [3/5] TCP+TLS 探活: %d 个通过", len(stats))
 
 	// 阶段 4: 测速（针对通过探活的 IP）
 	passed := s.speedTest(ctx, stats, sc)
+	logging.InfoTo("scanner", "  [4/5] 速度测试: %d 个达到 %.1fMB/s 阈值", len(passed), sc.MinSpeedMBps)
 
 	// 阶段 5: 按地区入库（只入速度达标的）
 	var savedByRegion map[string]int
@@ -135,12 +146,15 @@ func (s *Scanner) RunOnce() {
 	} else {
 		savedByRegion = s.saveByRegion(passed, sc)
 	}
+	logging.InfoTo("scanner", "  [5/5] 入库完成: %v", savedByRegion)
 
 	// 更新统计
 	total := len(candidates)
 	statsJSON := fmt.Sprintf(`{"cmin2":%v,"saved":%v,"scanned":%d,"speed_passed":%d}`,
 		savedByRegion, savedByRegion, total, len(passed))
 	s.finishRun(histID, "ok", total, len(passed), statsJSON)
+
+	logging.InfoTo("scanner", "✓ 扫描任务 #%d 完成: 候选 %d, 通过 %d", histID, total, len(passed))
 
 	// 记录到 history
 	hs, _ := s.store.ListScanHistory(50)

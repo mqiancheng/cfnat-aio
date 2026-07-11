@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"cfnat-aio/internal/config"
+	"cfnat-aio/internal/logging"
 )
 
 // Library CMIN2 IP 库
@@ -76,6 +77,10 @@ func (l *Library) AddIP(ip, region, source, colo string, speed, latency float64,
 	})
 	if err == nil {
 		l.reload()
+		logging.InfoTo("iplibrary", "已添加 IP %s → 地区 %s (来源=%s, colo=%s, 速度=%.1fMB/s)",
+			ip, region, source, colo, speed)
+	} else {
+		logging.ErrorTo("iplibrary", "添加 IP %s 失败: %v", ip, err)
 	}
 	return err
 }
@@ -85,12 +90,18 @@ func (l *Library) RemoveIP(ip, region string) error {
 	err := l.store.DeleteIP(ip, region)
 	if err == nil {
 		l.reload()
+		logging.InfoTo("iplibrary", "已删除 IP %s（地区 %s）", ip, region)
 	}
 	return err
 }
 
 // ListIPs 列出某地区所有 IP
+// region 为空时返回全部地区
 func (l *Library) ListIPs(region string) []config.IPEntry {
+	if region == "" {
+		all, _ := l.store.ListAllIPs()
+		return all
+	}
 	entries, _ := l.store.ListIPs(region)
 	return entries
 }

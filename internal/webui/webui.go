@@ -24,15 +24,18 @@ package webui
 import (
 	"embed"
 	"encoding/json"
+	"fmt"
 	"html/template"
 	"log"
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"cfnat-aio/internal/config"
 	"cfnat-aio/internal/fofa"
 	"cfnat-aio/internal/iplibrary"
+	"cfnat-aio/internal/logging"
 	"cfnat-aio/internal/proxy"
 	"cfnat-aio/internal/scanner"
 )
@@ -172,6 +175,60 @@ func (h *Handlers) HandleAPIRegion(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, 200, map[string]string{"status": "deleted"})
 	default:
 		writeError(w, 405, "method not allowed")
+	}
+}
+
+// === 日志系统 ===
+
+// HandleAPILogs 获取最近日志
+// GET /api/logs?limit=200
+func (h *Handlers) HandleAPILogs(w http.ResponseWriter, r *http.Request) {
+	limit := 200
+	if v := r.URL.Query().Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
+			limit = n
+		}
+	}
+	writeJSON(w, 200, logging.Default().Snapshot(limit))
+}
+
+// HandleAPILogsStream 实时日志流（SSE）
+// GET /api/logs/stream
+func (h *Handlers) HandleAPILogsStream(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+
+	sub, unsubscribe := logging.Default().Subscribe(true)
+	defer unsubscribe()
+
+	// 心跳（防止代理超时）
+	ticker := time.NewTicker(15 * time.Second)
+	defer ticker.Stop()
+
+	notify := r.Context().Done()
+	for {
+		select {
+		case <-notify:
+			return
+		case <-ticker.C:
+			fmt.Fprintf(w, ": heartbeat\n\n")
+			flusher.Flush()
+		case e, ok := <-sub.Ch:
+			if !ok {
+				return
+			}
+			data, _ := json.Marshal(e)
+			fmt.Fprintf(w, "data: %s\n\n", data)
+			flusher.Flush()
+		}
 	}
 }
 

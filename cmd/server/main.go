@@ -40,6 +40,9 @@ var (
 func main() {
 	flag.Parse()
 
+	// 初始化统一日志系统
+	logging.InitGlobal()
+
 	// 确保数据目录存在
 	if err := os.MkdirAll(filepath.Dir(*dbPath), 0o755); err != nil {
 		log.Fatalf("创建数据目录失败: %v", err)
@@ -166,6 +169,10 @@ func registerRoutes(mux *http.ServeMux, h *webui.Handlers) {
 
 	// 通用
 	mux.HandleFunc("/api/settings", h.HandleAPISettings)
+
+	// 日志
+	mux.HandleFunc("/api/logs", h.HandleAPILogs)
+	mux.HandleFunc("/api/logs/stream", h.HandleAPILogsStream)
 
 	// 代理
 	mux.HandleFunc("/api/proxy/status", h.HandleAPIProxyStatus)

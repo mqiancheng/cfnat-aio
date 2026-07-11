@@ -23,6 +23,7 @@ import (
 
 	"cfnat-aio/internal/config"
 	"cfnat-aio/internal/iplibrary"
+	"cfnat-aio/internal/logging"
 )
 
 // 全量 CF IP 兜底池（每 /24 抽 1 个，懒加载）
@@ -44,6 +45,12 @@ type Manager struct {
 	regions   map[string]config.ProxyRegion // region -> 最新配置
 
 	fallbackPicks map[string][]string // region -> 当前兜底池（懒填充）
+
+	// 运行状态（供 WebUI 显示）
+	running    bool
+	startedAt  time.Time
+	lastHealth map[string]time.Time // region -> 上次健康检查时间
+	currentIP  map[string]string    // region -> 当前代理中使用的 IP（从日志/手动）
 }
 
 // New 创建代理管理器
@@ -55,6 +62,8 @@ func New(store *config.SQLiteStore, lib *iplibrary.Library, cfgMgr *config.Manag
 		listeners:     make(map[string]*regionListener),
 		regions:       make(map[string]config.ProxyRegion),
 		fallbackPicks: make(map[string][]string),
+		lastHealth:    make(map[string]time.Time),
+		currentIP:     make(map[string]string),
 	}
 	return m
 }
@@ -128,9 +137,11 @@ func (m *Manager) startRegion(r config.ProxyRegion) *regionListener {
 	addr := fmt.Sprintf(":%d", r.Port)
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		log.Printf("[proxy] listen %s failed: %v", addr, err)
+		logging.ErrorTo("proxy", "✗ 监听 :%d 失败: %v", r.Port, err)
 		return nil
 	}
+	logging.InfoTo("proxy", "▶ 启动代理 %s → :%d (colo=%s, 当前可用 IP=%d)",
+		r.Name, r.Port, r.Code, m.lib.CountIPs(r.Name))
 	ctx, cancel := context.WithCancel(context.Background())
 	rl := &regionListener{
 		region: r,
@@ -176,9 +187,17 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	// 选 IP
 	target, isFallback, err := m.pickTarget(r.Name)
 	if err != nil {
-		log.Printf("[proxy] %s: no target IP: %v", r.Name, err)
+		logging.WarnTo("proxy", "%s: 没有可用目标 IP: %v", r.Name, err)
 		return
 	}
+	src := "IP库"
+	if isFallback {
+		src = "兜底池"
+	}
+	logging.InfoTo("proxy", "%s: 客户端 %s → %s (来源=%s)", r.Name, client.RemoteAddr(), target, src)
+	m.mu.Lock()
+	m.currentIP[r.Name] = target
+	m.mu.Unlock()
 
 	// 决定上游端口：默认 443（Cloudflare HTTPS 通用）
 	upstreamPort := 443
@@ -186,7 +205,9 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	upstream, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:%d", target, upstreamPort))
 	if err != nil {
-		log.Printf("[proxy] %s: dial %s: %v", r.Name, target, err)
+		logging.WarnTo("proxy", "%s: 连接 %s:443 失败: %v", r.Name, target, err)
+		// 标记为失败 1 次
+		_ = m.store.MarkIPChecked(target, r.Name, false, 0, 0)
 		return
 	}
 	defer upstream.Close()
@@ -413,6 +434,8 @@ type RegionStatus struct {
 	Enabled  bool   `json:"enabled"`
 	IPCount  int    `json:"ip_count"`
 	Listening bool  `json:"listening"`
+	CurrentIP string `json:"current_ip"` // 当前正在代理的 IP（从日志/手动）
+	Colo     string `json:"colo"`
 }
 
 // Status 获取所有地区状态
@@ -429,6 +452,8 @@ func (m *Manager) Status() Status {
 			Enabled:   r.Enabled,
 			IPCount:   m.lib.CountIPs(r.Name),
 			Listening: listening,
+			CurrentIP: m.currentIP[r.Name],
+			Colo:      r.Code,
 		})
 	}
 	return Status{Regions: out}

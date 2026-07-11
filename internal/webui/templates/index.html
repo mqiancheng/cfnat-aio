@@ -80,6 +80,31 @@ tr:hover { background: #1c2128; }
 #toast.show { opacity: 1; }
 #toast.error { border-color: #f85149; }
 #toast.success { border-color: #3fb950; }
+
+/* 日志面板 */
+.log-container {
+  background: #0d1117;
+  border: 1px solid #30363d;
+  border-radius: 6px;
+  padding: 8px 10px;
+  height: 480px;
+  overflow-y: auto;
+  font-family: 'Consolas','Monaco','Menlo',monospace;
+  font-size: 12px;
+  line-height: 1.5;
+}
+.log-line { padding: 2px 0; white-space: pre-wrap; word-break: break-all; }
+.log-line.info { color: #c9d1d9; }
+.log-line.warn { color: #d29922; }
+.log-line.error { color: #f85149; font-weight: 600; }
+.log-line.debug { color: #6e7681; }
+.log-line .ts { color: #6e7681; margin-right: 6px; }
+.log-line .lvl { display: inline-block; min-width: 42px; text-align: center; border-radius: 3px; margin-right: 6px; font-size: 10px; padding: 0 4px; }
+.log-line.info .lvl { background: #1f6feb33; color: #58a6ff; }
+.log-line.warn .lvl { background: #d2992233; color: #d29922; }
+.log-line.error .lvl { background: #f8514933; color: #f85149; }
+.log-line.debug .lvl { background: #6e768133; color: #6e7681; }
+.log-line .src { color: #8b949e; margin-right: 6px; }
 </style>
 </head>
 <body>
@@ -93,6 +118,7 @@ tr:hover { background: #1c2128; }
     <button class="tab" data-tab="ips">IP 库</button>
     <button class="tab" data-tab="scanner">扫描器</button>
     <button class="tab" data-tab="fofa">FOFA</button>
+    <button class="tab" data-tab="logs">📜 日志</button>
     <button class="tab" data-tab="settings">设置</button>
   </div>
 
@@ -267,6 +293,43 @@ tr:hover { background: #1c2128; }
     </table>
   </div>
 
+  <!-- 日志 -->
+  <div id="tab-logs" class="tab-content">
+    <div class="card">
+      <div class="card-title">实时日志</div>
+      <div class="field-row">
+        <div>
+          <label>来源过滤</label>
+          <select id="log-source-filter" onchange="renderLogs()">
+            <option value="">全部</option>
+            <option value="system">system</option>
+            <option value="proxy">proxy</option>
+            <option value="scanner">scanner</option>
+            <option value="iplibrary">iplibrary</option>
+            <option value="fofa">fofa</option>
+            <option value="webui">webui</option>
+          </select>
+        </div>
+        <div>
+          <label>级别过滤</label>
+          <select id="log-level-filter" onchange="renderLogs()">
+            <option value="">全部</option>
+            <option value="info">info+</option>
+            <option value="warn">warn+</option>
+            <option value="error">error only</option>
+          </select>
+        </div>
+        <div style="display:flex;align-items:flex-end;gap:6px">
+          <button class="primary" onclick="connectLogStream()">▶ 连接</button>
+          <button onclick="disconnectLogStream()">⏸ 暂停</button>
+          <button onclick="clearLogs()">🗑 清屏</button>
+        </div>
+      </div>
+      <div id="log-stream-status" class="muted" style="margin:8px 0">未连接</div>
+      <div id="log-container" class="log-container"></div>
+    </div>
+  </div>
+
   <!-- 设置 -->
   <div id="tab-settings" class="tab-content">
     <div class="card">
@@ -302,7 +365,90 @@ $$('.tab').forEach(t => t.addEventListener('click', () => {
   if (t.dataset.tab === 'scanner') loadScanner();
   if (t.dataset.tab === 'fofa') loadFOFA();
   if (t.dataset.tab === 'settings') loadSettings();
+  if (t.dataset.tab === 'logs') { loadLogs(); connectLogStream(); }
 }));
+
+// === 实时日志 ===
+let logBuffer = [];
+let logEventSource = null;
+const LOG_LEVEL_RANK = { debug: 0, info: 1, warn: 2, error: 3 };
+
+async function loadLogs() {
+  if (logBuffer.length === 0) {
+    try {
+      const arr = await api('GET', '/api/logs?limit=200');
+      logBuffer = arr || [];
+      renderLogs();
+    } catch (e) { /* ignore */ }
+  }
+}
+
+function connectLogStream() {
+  if (logEventSource) return;
+  if (typeof EventSource === 'undefined') {
+    $('#log-stream-status').textContent = '浏览器不支持 SSE';
+    return;
+  }
+  logEventSource = new EventSource('/api/logs/stream');
+  logEventSource.onopen = () => {
+    $('#log-stream-status').textContent = '● 已连接（实时推送中）';
+    $('#log-stream-status').style.color = '#3fb950';
+  };
+  logEventSource.onerror = () => {
+    $('#log-stream-status').textContent = '● 连接断开，5秒后重连...';
+    $('#log-stream-status').style.color = '#f85149';
+    logEventSource.close();
+    logEventSource = null;
+    setTimeout(connectLogStream, 5000);
+  };
+  logEventSource.onmessage = (ev) => {
+    try {
+      const e = JSON.parse(ev.data);
+      logBuffer.push(e);
+      if (logBuffer.length > 1000) logBuffer = logBuffer.slice(-1000);
+      renderLogs();
+    } catch (err) { /* ignore */ }
+  };
+}
+
+function disconnectLogStream() {
+  if (logEventSource) {
+    logEventSource.close();
+    logEventSource = null;
+    $('#log-stream-status').textContent = '● 已暂停';
+    $('#log-stream-status').style.color = '#8b949e';
+  }
+}
+
+function clearLogs() {
+  logBuffer = [];
+  renderLogs();
+}
+
+function renderLogs() {
+  const c = $('#log-container');
+  if (!c) return;
+  const srcFilter = $('#log-source-filter').value;
+  const lvlFilter = $('#log-level-filter').value;
+  const minRank = lvlFilter ? (LOG_LEVEL_RANK[lvlFilter] || 0) : 0;
+  const filtered = logBuffer.filter(e => {
+    if (srcFilter && e.source !== srcFilter) return false;
+    if (minRank > 0 && (LOG_LEVEL_RANK[e.level] || 1) < minRank) return false;
+    return true;
+  });
+  // 限制渲染条数（避免卡顿）
+  const shown = filtered.slice(-300);
+  c.innerHTML = shown.map(e => {
+    const ts = new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false });
+    return `<div class="log-line ${e.level}"><span class="ts">${ts}</span><span class="lvl">${(e.level||'').toUpperCase()}</span><span class="src">[${e.source}]</span>${escapeHtml(e.message)}</div>`;
+  }).join('');
+  // 自动滚动到底部
+  c.scrollTop = c.scrollHeight;
+}
+
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
 
 // Toast
 function toast(msg, type='') {
@@ -339,9 +485,10 @@ async function refreshDash() {
       const div = document.createElement('div');
       div.className = 'card';
       const portHint = r.enabled ? '<span class="status-ok mono">:'+r.port+'</span>' : '<span class="muted mono">已禁用</span>';
+      const curIP = r.current_ip ? `<span class="mono" style="color:#3fb950">→ ${r.current_ip}</span>` : '<span class="muted mono">未在使用</span>';
       div.innerHTML = `<div class="card-row">
-        <div style="flex:1"><strong>${r.name}</strong> ${portHint}</div>
-        <div><span class="muted">IP:</span> <span class="mono">${r.ip_count}</span></div>
+        <div style="flex:1"><strong>${r.name}</strong> ${portHint} ${curIP}</div>
+        <div><span class="muted">库内 IP:</span> <span class="mono">${r.ip_count}</span></div>
         <div><span class="muted">监听:</span> <span class="badge ${r.listening ? 'green' : 'gray'}">${r.listening ? '是' : '否'}</span></div>
         <div><span class="muted">客户端:</span> <span class="mono">192.168.7.4:${r.port}</span></div>
       </div>`;
@@ -419,17 +566,18 @@ async function deleteRegion(name) {
 
 // === IP 库 ===
 async function loadIPs() {
-  // 填充地区选项
+  // 填充地区选项（合并已配置 region + 已有 IP 的 region，避免遗漏）
   const regions = await api('GET', '/api/regions');
+  const allIPsRaw = await api('GET', '/api/ips'); // 后端空 region=查全部
+  const regionSet = new Set(regions.map(r => r.name));
+  allIPsRaw.forEach(e => regionSet.add(e.region));
   const sel = $('#ip-region-filter');
   const old = sel.value;
-  sel.innerHTML = '<option value="">全部</option>' + regions.map(r => `<option value="${r.name}">${r.name}</option>`).join('');
+  sel.innerHTML = '<option value="">全部</option>' +
+    [...regionSet].sort().map(n => `<option value="${n}">${n}</option>`).join('');
   sel.value = old;
-  const allIPs = [];
-  for (const r of regions) {
-    const ips = await api('GET', '/api/ips?region=' + encodeURIComponent(r.name));
-    allIPs.push(...ips);
-  }
+  const regionFilter = sel.value;
+  const allIPs = regionFilter ? allIPsRaw.filter(x => x.region === regionFilter) : allIPsRaw;
   const src = $('#ip-source-filter').value;
   const filtered = src ? allIPs.filter(x => x.source === src) : allIPs;
   const tbody = $('#ips-table');
@@ -441,7 +589,7 @@ async function loadIPs() {
       <td>${e.colo || '-'}</td>
       <td class="mono">${e.speed_mbps ? e.speed_mbps.toFixed(2) : '-'} MB/s</td>
       <td class="mono">${e.latency_ms ? e.latency_ms.toFixed(0) : '-'} ms</td>
-      <td><span class="badge ${e.source==='manual'?'blue':e.source==='fofa'?'green':'gray'}">${e.source}</span></td>
+      <td><span class="badge ${e.source==='manual'?'blue':e.source==='fofa'?'green':'gray'}">${e.source || '-'}</span></td>
       <td>${e.fail_count || 0}</td>
       <td><button class="danger" onclick="removeIP('${e.ip}','${e.region}')">删除</button></td>
     </tr>`;
@@ -631,7 +779,7 @@ async function saveSettings() {
 
 // 启动
 refreshDash();
-setInterval(refreshDash, 10000);
+setInterval(refreshDash, 5000);
 </script>
 </body>
 </html>
