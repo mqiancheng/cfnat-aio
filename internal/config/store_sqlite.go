@@ -130,17 +130,17 @@ func (s *SQLiteStore) SaveRegions(regions []ProxyRegion) error {
 // === IP 库读写 ===
 
 type IPEntry struct {
-	IP        string
-	Region    string
-	Colo      string
-	SpeedMbps float64
-	LatencyMs float64
-	Source    string
-	AddedAt   string
-	LastCheck string
-	LastOK    bool
-	FailCount int
-	Note      string
+	IP        string  `json:"ip"`
+	Region    string  `json:"region"`
+	Colo      string  `json:"colo"`
+	SpeedMbps float64 `json:"speed_mbps"`
+	LatencyMs float64 `json:"latency_ms"`
+	Source    string  `json:"source"`
+	AddedAt   string  `json:"added_at"`
+	LastCheck string  `json:"last_check"`
+	LastOK    bool    `json:"last_ok"`
+	FailCount int     `json:"fail_count"`
+	Note      string  `json:"note"`
 }
 
 type IPMeta struct {

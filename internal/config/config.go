@@ -123,7 +123,7 @@ func defaultScannerConfig() ScannerConfig {
 	return ScannerConfig{
 		Enabled:      false,
 		Interval:     60,
-		MinSpeedMBps: 2.0,
+		MinSpeedMBps: 3.0,
 		IPType:       4,
 		Port:         443,
 		SamplesPer24: 1,

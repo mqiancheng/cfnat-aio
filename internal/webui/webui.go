@@ -27,6 +27,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"cfnat-aio/internal/config"
@@ -320,10 +321,10 @@ func (h *Handlers) HandleAPIScannerHistory(w http.ResponseWriter, r *http.Reques
 
 // === IP 导入探测 ===
 
-// HandleAPIIPImportProbe 批量导入 IP 并探测 CMIN2
+// HandleAPIIPImportProbe 批量导入 IP 并探测 CMIN2 + 测速
 // POST /api/ips/import-probe
 // body: {"ips": ["ip:port", ...], "auto_import": true}
-// 响应: 探测结果 + 入库统计
+// 流程: 解析 → 去重 → 探活(取colo) → 测速(达标>阈值入库) → 返回详细结果
 func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, 405, "method not allowed")
@@ -342,23 +343,28 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	// 解析 IP（支持 ip:port 和纯 ip 格式）
+	// 解析 IP（支持 ip:port#注释 和纯 ip 格式）
 	var targetIPs []string
+	rawMap := make(map[string]string) // ip → 原始注释
 	for _, raw := range req.IPs {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
 		}
-		// 去掉 # 后的注释部分（如 #HK Hong Kong AS906）
+		note := ""
 		if idx := strings.Index(raw, "#"); idx >= 0 {
+			note = strings.TrimSpace(raw[idx+1:])
 			raw = raw[:idx]
 		}
 		raw = strings.TrimSpace(raw)
-		// 提取纯 IP（去掉 :port 部分）
+		ip := raw
 		if idx := strings.LastIndex(raw, ":"); idx > 0 {
-			raw = raw[:idx]
+			ip = raw[:idx]
 		}
-		targetIPs = append(targetIPs, raw)
+		targetIPs = append(targetIPs, ip)
+		if note != "" {
+			rawMap[ip] = note
+		}
 	}
 
 	if len(targetIPs) == 0 {
@@ -377,30 +383,96 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 			deduped = append(deduped, ip)
 		}
 	}
+	logging.InfoTo("webui", "去重后: %d 个 IP，开始探活...", len(deduped))
 
-	// 并发探活
+	// 阶段 1: 并发探活（取 colo）
 	sc := h.CfgMgr.Scanner()
-	// 导入模式：放松延迟阈值，不限速
 	importCfg := sc
-	importCfg.MaxDelayMs = 5000 // 导入时延迟要求放松
+	importCfg.MaxDelayMs = 5000
 	results := scanner.ProbeBatch(deduped, importCfg)
 
-	// 统计
+	// 阶段 2: 对 CMIN2 节点进行测速
 	type ProbeItem struct {
-		IP      string  `json:"ip"`
-		Colo    string  `json:"colo"`
-		IsCMIN2 bool    `json:"is_cmin2"`
-		OK      bool    `json:"ok"`
-		Error   string  `json:"error"`
-		Latency float64 `json:"latency_ms"`
-		Imported bool   `json:"imported"`
+		IP       string  `json:"ip"`
+		Colo     string  `json:"colo"`
+		IsCMIN2  bool    `json:"is_cmin2"`
+		OK       bool    `json:"ok"`
+		Error    string  `json:"error"`
+		Latency  float64 `json:"latency_ms"`
+		SpeedMbps float64 `json:"speed_mbps"`
+		Imported bool    `json:"imported"`
+		Note     string  `json:"note"`
 	}
 
 	items := make([]ProbeItem, 0, len(results))
 	imported := 0
 	cmin2Count := 0
 	totalOK := 0
+	speedPassed := 0
+	minSpeed := sc.MinSpeedMBps
+	if minSpeed <= 0 {
+		minSpeed = 3.0
+	}
 
+	// 收集 CMIN2 候选（需要测速）
+	var cmin2Candidates []struct {
+		ip   string
+		colo string
+		lat  float64
+		note string
+	}
+	for _, r := range results {
+		if r.OK && scanner.IsCMIN2Colo(r.Colo) {
+			cmin2Candidates = append(cmin2Candidates, struct {
+				ip   string
+				colo string
+				lat  float64
+				note string
+			}{r.IP, r.Colo, r.Latency, rawMap[r.IP]})
+			cmin2Count++
+			totalOK++
+		} else if r.OK {
+			totalOK++
+		}
+	}
+
+	// 阶段 2: 对 CMIN2 候选测速
+	speedResults := make(map[string]float64) // ip → mbps
+	if len(cmin2Candidates) > 0 {
+		logging.InfoTo("webui", "发现 %d 个 CMIN2 候选，开始测速(阈值 %.1fMB/s)...", len(cmin2Candidates), minSpeed)
+		// 用 scanner 的测速逻辑（并发测速）
+		speedURL := ""
+		if sc.SpeedTestURL == "" || sc.SpeedTestURL == "auto" {
+			speedURL = "https://speed.cloudflare.com/__down?bytes=10485760"
+		} else {
+			speedURL = sc.SpeedTestURL
+		}
+		// 逐批测速（限制并发 30）
+		type speedTask struct {
+			ip   string
+			colo string
+			lat  float64
+			note string
+		}
+		sem := make(chan struct{}, 30)
+		var wg sync.WaitGroup
+		var mu sync.Mutex
+		for _, c := range cmin2Candidates {
+			wg.Add(1)
+			sem <- struct{}{}
+			go func(ip, colo string, lat float64, note string) {
+				defer wg.Done()
+				defer func() { <-sem }()
+				mbps, _ := h.Scanner.MeasureSpeed(ip, speedURL, sc.Port)
+				mu.Lock()
+				speedResults[ip] = mbps
+				mu.Unlock()
+			}(c.ip, c.colo, c.lat, c.note)
+		}
+		wg.Wait()
+	}
+
+	// 组装结果 + 入库（测速达标才入库）
 	for _, r := range results {
 		isCMIN2 := r.OK && scanner.IsCMIN2Colo(r.Colo)
 		item := ProbeItem{
@@ -410,14 +482,16 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 			OK:      r.OK,
 			Error:   r.Error,
 			Latency: r.Latency,
+			Note:    rawMap[r.IP],
 		}
-		if r.OK {
-			totalOK++
-			if isCMIN2 {
-				cmin2Count++
+		if isCMIN2 {
+			mbps := speedResults[r.IP]
+			item.SpeedMbps = mbps
+			if mbps >= minSpeed {
+				speedPassed++
 				if req.AutoImport {
 					region := r.Colo
-					err := h.Lib.AddIP(r.IP, region, "import", r.Colo, 0, r.Latency, "批量导入")
+					err := h.Lib.AddIP(r.IP, region, "import", r.Colo, mbps, r.Latency, rawMap[r.IP])
 					if err == nil {
 						item.Imported = true
 						imported++
@@ -428,17 +502,19 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 		items = append(items, item)
 	}
 
-	logging.InfoTo("webui", "导入探测完成: 去重后 %d 个, 探活成功 %d, CMIN2 %d, 已入库 %d",
-		len(deduped), totalOK, cmin2Count, imported)
+	logging.InfoTo("webui", "导入探测完成: 去重 %d, 探活 %d, CMIN2 %d, 测速达标 %d, 入库 %d",
+		len(deduped), totalOK, cmin2Count, speedPassed, imported)
 
 	writeJSON(w, 200, map[string]interface{}{
-		"total":       len(deduped),
-		"probed":      len(results),
-		"ok":          totalOK,
-		"cmin2":       cmin2Count,
-		"imported":    imported,
-		"auto_import": req.AutoImport,
-		"results":     items,
+		"total":        len(deduped),
+		"probed":       len(results),
+		"ok":           totalOK,
+		"cmin2":        cmin2Count,
+		"speed_passed": speedPassed,
+		"min_speed":    minSpeed,
+		"imported":     imported,
+		"auto_import":  req.AutoImport,
+		"results":      items,
 	})
 }
 

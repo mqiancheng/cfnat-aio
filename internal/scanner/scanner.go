@@ -385,8 +385,8 @@ func (s *Scanner) probeAndTrace(ctx context.Context, ips []string, sc config.Sca
 	}
 	var wg sync.WaitGroup
 	sem := make(chan struct{}, threads)
-	var idx int64
 	var probed int64
+	total := int64(len(ips))
 
 	for i := range ips {
 		select {
@@ -402,13 +402,13 @@ func (s *Scanner) probeAndTrace(ctx context.Context, ips []string, sc config.Sca
 			r := s.probeOne(ip, sc)
 			results[idx] = r
 			n := atomic.AddInt64(&probed, 1)
-			if n%50 == 0 {
-				_ = n
+			// 每 500 个汇报一次进度
+			if n%500 == 0 || n == total {
+				logging.InfoTo("scanner", "    探活进度: %d/%d (%.0f%%)", n, total, float64(n)/float64(total)*100)
 			}
 		}(i, ips[i])
 	}
 	wg.Wait()
-	_ = idx
 	return results
 }
 
@@ -447,6 +447,10 @@ func (s *Scanner) speedTest(ctx context.Context, probes []ProbeResult, sc config
 	results := make([]speedResult, len(targets))
 	sem := make(chan struct{}, threads)
 	var wg sync.WaitGroup
+	var tested int64
+	total := int64(len(targets))
+
+	logging.InfoTo("scanner", "    开始测速: %d 个 IP，并发 %d，阈值 %.1fMB/s", total, threads, sc.MinSpeedMBps)
 
 	for i, t := range targets {
 		select {
@@ -465,6 +469,10 @@ func (s *Scanner) speedTest(ctx context.Context, probes []ProbeResult, sc config
 				r.err = fmt.Sprintf("测速失败/%.2fMbps", speed)
 			}
 			results[i] = r
+			n := atomic.AddInt64(&tested, 1)
+			if n%50 == 0 || n == total {
+				logging.InfoTo("scanner", "    测速进度: %d/%d (%.0f%%)", n, total, float64(n)/float64(total)*100)
+			}
 		}(i, t.IP, t.Colo, t.Latency)
 	}
 	wg.Wait()
@@ -484,6 +492,10 @@ func (s *Scanner) pickSpeedURL(cfg string) string {
 		}
 		return cfg
 	}
+}
+
+func (s *Scanner) MeasureSpeed(ip, speedURL string, port int) (float64, bool) {
+	return s.measureSpeed(ip, speedURL, port)
 }
 
 func (s *Scanner) measureSpeed(ip, speedURL string, port int) (float64, bool) {
