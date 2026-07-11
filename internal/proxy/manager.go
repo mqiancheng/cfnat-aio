@@ -110,13 +110,13 @@ func (m *Manager) Sync() error {
 type regionListener struct {
 	region config.ProxyRegion
 	ln     net.Listener
-	stop   context.CancelFunc
+	cancel context.CancelFunc
 	done   chan struct{}
 }
 
 func (rl *regionListener) stop() {
-	if rl.stop != nil {
-		rl.stop()
+	if rl.cancel != nil {
+		rl.cancel()
 	}
 	if rl.ln != nil {
 		_ = rl.ln.Close()
