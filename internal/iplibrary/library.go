@@ -156,7 +156,8 @@ func (l *Library) HealthCheck(region string, checkFn func(ip string) (ok bool, l
 // HealthCheckAll 对所有地区做健康检查
 func (l *Library) HealthCheckAll(checkFn func(ip string) (ok bool, latencyMs float64)) map[string][2]int {
 	regions := make(map[string]bool)
-	for _, r := range l.store.ListAllIPs() {
+	all, _ := l.store.ListAllIPs()
+	for _, r := range all {
 		regions[r.Region] = true
 	}
 	out := make(map[string][2]int)
