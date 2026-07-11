@@ -54,7 +54,7 @@ var templatesFS embed.FS
 // New 创建 Handlers
 func New(store *config.SQLiteStore, cfgMgr *config.Manager, lib *iplibrary.Library,
 	sc *scanner.Scanner, pm *proxy.Manager) *Handlers {
-	tpl := template.Must(template.ParseFS(templatesFS, "templates/*.html"))
+	tpl := template.Must(template.New("").Delims("[[", "]]").ParseFS(templatesFS, "templates/*.html"))
 	return &Handlers{
 		Store: store, CfgMgr: cfgMgr, Lib: lib,
 		Scanner: sc, Proxy: pm,
