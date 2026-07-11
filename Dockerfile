@@ -7,13 +7,16 @@ RUN apk add --no-cache gcc musl-dev
 
 WORKDIR /src
 
-# 复制全部源码
+# 先复制依赖描述文件，单独下载依赖（命中缓存，下次构建秒过）
+COPY go.mod go.sum* ./
+RUN go env -w GOPROXY=https://proxy.golang.org,direct && \
+    go mod download
+
+# 再复制源码（依赖层缓存生效）
 COPY . .
 
-# 整理依赖（生成 go.sum）+ 编译
-RUN go env -w GOPROXY=https://proxy.golang.org,direct && \
-    go mod tidy && \
-    CGO_ENABLED=1 go build -ldflags="-s -w" -o /out/cfnat-aio ./cmd/server
+# 编译（再次确保 go.sum 完整，避免本地 go.sum 缺失时仍可工作）
+RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /out/cfnat-aio ./cmd/server
 
 # 第二阶段：最小运行时镜像
 FROM alpine:3.19
