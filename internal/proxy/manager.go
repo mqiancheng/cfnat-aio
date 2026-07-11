@@ -135,7 +135,7 @@ func (m *Manager) startRegion(r config.ProxyRegion) *regionListener {
 	rl := &regionListener{
 		region: r,
 		ln:     ln,
-		stop:   cancel,
+		cancel: cancel,
 		done:   make(chan struct{}),
 	}
 	go func() {
