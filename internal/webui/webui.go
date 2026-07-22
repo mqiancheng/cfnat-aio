@@ -308,6 +308,7 @@ func (h *Handlers) HandleAPIIPRemove(w http.ResponseWriter, r *http.Request) {
 	// 删除的可能是代理正在使用的收藏 IP，需通知代理重新加载该地区 IP 池，
 	// 否则代理会继续转发到已删除的 IP 直到重启。
 	go h.Proxy.RefreshRegionIPs(req.Region)
+	h.Proxy.ScheduleDomainSync(req.Region) // 收藏可能变化 → 防抖同步优选域名
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -352,6 +353,7 @@ func (h *Handlers) HandleAPIIPPriority(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Lib.Reload()
 	go h.Proxy.RefreshRegionIPs(req.Region)
+	h.Proxy.ScheduleDomainSync(req.Region) // 收藏变化 → 防抖同步优选域名
 	writeJSON(w, 200, map[string]interface{}{"status": "ok", "priority": req.Priority})
 }
 
@@ -381,7 +383,32 @@ func (h *Handlers) HandleAPIIPReorder(w http.ResponseWriter, r *http.Request) {
 	}
 	h.Lib.Reload()
 	go h.Proxy.RefreshRegionIPs(req.Region)
+	h.Proxy.ScheduleDomainSync(req.Region) // 排序变化 → 防抖同步优选域名
 	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// HandleAPIDomainSync 手动立即同步某地区优选域名（无视自动开关）
+// POST /api/domains/sync  body: {"region":"HKG"}
+func (h *Handlers) HandleAPIDomainSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		Region string `json:"region"`
+	}
+	if err := readJSON(r, &req); err != nil || req.Region == "" {
+		writeError(w, 400, "region 必填")
+		return
+	}
+	h.Proxy.SyncRegionDomain(req.Region, true)
+	writeJSON(w, 200, h.Proxy.DomainSyncStatusMap())
+}
+
+// HandleAPIDomainStatus 各地区优选域名同步状态
+// GET /api/domains/status
+func (h *Handlers) HandleAPIDomainStatus(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, 200, h.Proxy.DomainSyncStatusMap())
 }
 
 // === 扫描器 ===

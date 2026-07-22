@@ -30,6 +30,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"cfnat-aio/internal/cfdns"
 	"cfnat-aio/internal/config"
 	"cfnat-aio/internal/iplibrary"
 	"cfnat-aio/internal/logging"
@@ -145,6 +146,12 @@ type Manager struct {
 	SpeedTestFn func(ip, speedURL string, port, sec int) (float64, bool)
 	autoTested  map[string]bool // "region|ip" -> 本进程已自动测速过（去重防复测）
 
+	// 优选域名同步（收藏 IP → CF A/AAAA 记录，全量对齐）
+	syncMu           sync.Mutex
+	domainSyncMu     sync.Mutex                 // 串行化同步执行，防并发双跑重复建记录
+	domainSyncTimers map[string]*time.Timer      // region -> 防抖定时器
+	domainSyncStatus map[string]*DomainSyncStatus // region -> 上次同步状态
+
 	// 常驻扫描（cfnat-docker 同款 scanIPs 循环）：每个 enabled 地区一个后台 goroutine
 	scanMu           sync.Mutex                    // 保护 regionScanCancel（与 m.mu 分开，避免 Sync 死锁）
 	regionScanCancel map[string]context.CancelFunc // region -> 取消函数
@@ -167,6 +174,8 @@ func New(store *config.SQLiteStore, lib *iplibrary.Library, cfgMgr *config.Manag
 		regions:       make(map[string]config.ProxyRegion),
 		fallbackPicks:    make(map[string][]string),
 		autoTested:       make(map[string]bool),
+		domainSyncTimers: make(map[string]*time.Timer),
+		domainSyncStatus: make(map[string]*DomainSyncStatus),
 		regionScanCancel: make(map[string]context.CancelFunc),
 		scanInterval:     10 * time.Minute,
 		lastHealth:       make(map[string]time.Time),
@@ -263,6 +272,8 @@ func regionNeedsRestart(old, new config.ProxyRegion) bool {
 // use_pinned 变化时复用 RefreshRegionIPs 的换池逻辑（热切换收藏/兜底，不重启端口）。
 func (m *Manager) applyRegionConfigLocked(rl *regionListener, r config.ProxyRegion) {
 	pinnedChanged := rl.region.UsePinned != r.UsePinned
+	domainChanged := rl.region.PreferDomain != r.PreferDomain
+	syncTurnedOn := !rl.region.DomainSync && r.DomainSync
 	rl.region.IPNum = r.IPNum
 	rl.region.Task = r.Task
 	rl.region.Random = r.Random
@@ -270,8 +281,14 @@ func (m *Manager) applyRegionConfigLocked(rl *regionListener, r config.ProxyRegi
 	rl.region.Fallback = r.Fallback
 	rl.region.IPCount = r.IPCount
 	rl.region.LastCheck = r.LastCheck
+	rl.region.PreferDomain = r.PreferDomain
+	rl.region.DomainSync = r.DomainSync
 	rl.region.UsePinned = r.UsePinned
 	rl.usePinned.Store(r.UsePinned)
+	// 优选域名：打开自动同步 / 修改了优选域名 → 立即对齐一次（防抖路径之外的即时触发）
+	if syncTurnedOn || (domainChanged && r.DomainSync && r.PreferDomain != "") {
+		go m.SyncRegionDomain(r.Name, false)
+	}
 	if !pinnedChanged {
 		return
 	}
@@ -281,6 +298,8 @@ func (m *Manager) applyRegionConfigLocked(rl *regionListener, r config.ProxyRegi
 	rl.ipMgr.refresh(ips)
 	if !r.UsePinned && len(ips) > 0 {
 		rl.ipMgr.markFallback()
+	} else if r.UsePinned && len(ips) > 0 {
+		rl.ipMgr.unmarkFallback()
 	}
 	needReselect := false
 	if rl.ipMgr.getCurrentIP() == "" {
@@ -392,6 +411,14 @@ func (im *ipManager) markFallback() {
 	im.mu.Lock()
 	defer im.mu.Unlock()
 	im.fallbackMode = true
+}
+
+// unmarkFallback 清除兜底模式标记（切回收藏 IP 模式时调用，
+// 否则会出现"用的是收藏 IP 却显示兜底"的错误徽章）
+func (im *ipManager) unmarkFallback() {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.fallbackMode = false
 }
 
 // isFallback 判断 currentIP 是否来自兜底池
@@ -553,34 +580,9 @@ func (m *Manager) startRegion(r config.ProxyRegion) *regionListener {
 	return rl
 }
 
-// resolveDomainIPs 解析域名得到 IPv4 列表（支持多 A 记录轮询）
-// 域名应关闭 Cloudflare 代理（灰色云朵），A 记录直接指向优选 IP
-func (m *Manager) resolveDomainIPs(domain string) []string {
-	host := domain
-	if i := strings.Index(host, "/"); i > 0 {
-		host = host[:i]
-	}
-	if host == "" {
-		return nil
-	}
-	ips, err := net.LookupIP(host)
-	if err != nil {
-		logging.ErrorTo("proxy", "域名 %s 解析失败: %v", host, err)
-		return nil
-	}
-	var out []string
-	for _, ip := range ips {
-		if v4 := ip.To4(); v4 != nil {
-			out = append(out, v4.String())
-		}
-	}
-	return out
-}
-
 // initRegionIPs 初始化地区 IP 池
 //   - 只使用收藏的 IP（priority<=2）作为代理候选，按优先级升序、速度降序排列
 //   - 无收藏 IP 时返回 nil（代理将直接走常驻扫描热池/兜底池）
-//   - 域名模式（UseDomainIP=true）：解析 Domain 得到多 IP（由测速脚本维护为优选低延迟 IP）
 func (m *Manager) initRegionIPs(r config.ProxyRegion) []string {
 	// 开关关闭时：不使用收藏 IP，使用 cfnat-docker 同款兜底池（即 IP 列表本身）
 	if !r.UsePinned {
@@ -594,15 +596,6 @@ func (m *Manager) initRegionIPs(r config.ProxyRegion) []string {
 		}
 		logging.InfoTo("proxy", "地区 %s 兜底池尚未就绪，首次连接时按需扫描", r.Name)
 		return nil
-	}
-	// 域名模式：解析 Domain 得到多 IP 作为转发目标池
-	if r.UseDomainIP && r.Domain != "" {
-		ips := m.resolveDomainIPs(r.Domain)
-		if len(ips) > 0 {
-			logging.InfoTo("proxy", "地区 %s 域名模式: %s 解析到 %d 个IP（DNS 已优选）", r.Name, r.Domain, len(ips))
-			return ips
-		}
-		logging.WarnTo("proxy", "地区 %s 域名 %s 解析为空，回退到收藏IP", r.Name, r.Domain)
 	}
 	// IP 库模式：只取收藏 IP（priority>0）
 	entries := m.lib.ListIPs(r.Name)
@@ -643,15 +636,6 @@ func normPriority(p int) int {
 // selectInitialIP 选第一个有效 IP
 func (m *Manager) selectInitialIP(rl *regionListener) {
 	ips := rl.ipMgr.getIPs()
-	if rl.region.UseDomainIP {
-		// 域名模式：DNS 里的 IP 已是测速脚本筛选的优选低延迟 IP，
-		// 直接选第一个（DNS 轮询本身提供多 IP 负载均衡），无需再做延迟筛选
-		if len(ips) > 0 {
-			rl.ipMgr.setCurrentIP(ips[0])
-			logging.InfoTo("proxy", "地区 %s 域名模式初始 currentIP = %s（共 %d 个候选，DNS 已优选）", rl.region.Name, ips[0], len(ips))
-		}
-		return
-	}
 	// IP 库模式：选第一个可达的
 	for _, ip := range ips {
 		if m.checkValidIP(ip, rl.region) {
@@ -1209,10 +1193,6 @@ func (m *Manager) refreshCurrentDelay(rl *regionListener, r config.ProxyRegion) 
 // getFallbackCandidates 懒加载兜底池（与旧 cfnat 一致：全量 CF IP 范围）
 // 每个 /24 生成 samplesPer24 个随机 IP，保证足够大的候选池来找到低延迟 IP
 func (m *Manager) getFallbackCandidates(r config.ProxyRegion) []string {
-	// 域名模式：兜底也用域名解析（可能拿到更新的 IP）
-	if r.UseDomainIP && r.Domain != "" {
-		return m.resolveDomainIPs(r.Domain)
-	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if cached, ok := m.fallbackPicks[r.Name]; ok && len(cached) > 0 {
@@ -1493,9 +1473,12 @@ func (m *Manager) RefreshRegionIPs(region string) {
 	ips := m.initRegionIPs(r)
 	rl.ipMgr.refresh(ips)
 
-	// 兜底模式下 refresh 不改变 fallbackMode，此处显式恢复标记
+	// fallbackMode 跟随实际来源：用兜底池则打标记；切回收藏模式（有收藏 IP）则清除标记，
+	// 否则会出现"用的是收藏 IP 却显示兜底"的错误徽章
 	if !r.UsePinned && len(ips) > 0 {
 		rl.ipMgr.markFallback()
+	} else if r.UsePinned && len(ips) > 0 {
+		rl.ipMgr.unmarkFallback()
 	}
 
 	// refresh 后两种情况需要重新选 currentIP：
@@ -1513,6 +1496,112 @@ func (m *Manager) RefreshRegionIPs(region string) {
 	if needReselect {
 		m.selectInitialIP(rl)
 	}
+}
+
+// DomainSyncStatus 优选域名同步状态（WebUI 展示）
+type DomainSyncStatus struct {
+	Time    string `json:"time"`
+	Success bool   `json:"success"`
+	Message string `json:"message"`
+	Records int    `json:"records"`
+}
+
+// ScheduleDomainSync 防抖调度自动同步（收藏增删/改排序后 30s 合并触发，避免 API 刷屏）
+func (m *Manager) ScheduleDomainSync(region string) {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+	if t, ok := m.domainSyncTimers[region]; ok {
+		t.Stop()
+	}
+	m.domainSyncTimers[region] = time.AfterFunc(30*time.Second, func() {
+		m.SyncRegionDomain(region, false)
+	})
+}
+
+// DomainSyncStatusMap 返回各地区同步状态（供 API 展示）
+func (m *Manager) DomainSyncStatusMap() map[string]DomainSyncStatus {
+	m.syncMu.Lock()
+	defer m.syncMu.Unlock()
+	out := make(map[string]DomainSyncStatus, len(m.domainSyncStatus))
+	for k, v := range m.domainSyncStatus {
+		out[k] = *v
+	}
+	return out
+}
+
+func (m *Manager) setDomainSyncStatus(region string, ok bool, msg string, n int) {
+	m.syncMu.Lock()
+	m.domainSyncStatus[region] = &DomainSyncStatus{
+		Time:    time.Now().Format("2006-01-02 15:04:05"),
+		Success: ok, Message: msg, Records: n,
+	}
+	m.syncMu.Unlock()
+}
+
+// StartupDomainSync 启动对齐：开启自动同步且配置了优选域名的地区各同步一次
+func (m *Manager) StartupDomainSync() {
+	for _, r := range m.cfgMgr.Regions() {
+		if r.Enabled && r.DomainSync && r.PreferDomain != "" {
+			go m.SyncRegionDomain(r.Name, false)
+		}
+	}
+}
+
+// SyncRegionDomain 把地区收藏 IP 全量对齐到优选域名的 A/AAAA 记录：
+//   - 内容：收藏 IP（priority>0，按排位号升序），v4 写 A、v6 写 AAAA，ttl=60 灰云
+//   - 空收藏 → 删光该域名全部 A/AAAA 记录
+//   - force=false 受地区 domain_sync 开关约束；force=true（手动按钮）无视开关
+//   - 失败只记状态与日志，绝不影响代理
+func (m *Manager) SyncRegionDomain(region string, force bool) {
+	live := m.liveRegion(region)
+	if live == nil {
+		return
+	}
+	r := *live
+	if !force && !r.DomainSync {
+		return
+	}
+	// 串行化：保存触发的自动同步与手动按钮可能并发，并发双跑会重复创建记录
+	// （先手建完，后手撞 identical record already exists），互斥后二次运行自然收敛
+	m.domainSyncMu.Lock()
+	defer m.domainSyncMu.Unlock()
+	g := m.cfgMgr.General()
+	if g.CFAPIToken == "" || g.CFZone == "" {
+		m.setDomainSyncStatus(region, false, "未配置 CF API Token / 主域名（见设置页）", 0)
+		return
+	}
+	fqdn := strings.ToLower(strings.TrimSpace(r.PreferDomain))
+	zone := strings.ToLower(strings.TrimSpace(g.CFZone))
+	if fqdn == "" {
+		m.setDomainSyncStatus(region, false, "未设置优选域名", 0)
+		return
+	}
+	if fqdn != zone && !strings.HasSuffix(fqdn, "."+zone) {
+		m.setDomainSyncStatus(region, false, "优选域名须挂在主域名 "+zone+" 下", 0)
+		return
+	}
+	// 收藏 IP（priority>0，按排位号升序）
+	entries := m.lib.ListIPs(region)
+	var pinned []config.IPEntry
+	for _, e := range entries {
+		if e.Priority > 0 {
+			pinned = append(pinned, e)
+		}
+	}
+	sort.Slice(pinned, func(i, j int) bool { return pinned[i].Priority < pinned[j].Priority })
+	ips := make([]string, 0, len(pinned))
+	for _, e := range pinned {
+		ips = append(ips, e.IP)
+	}
+	created, deleted, err := cfdns.SyncRecords(g.CFAPIToken, zone, fqdn, ips)
+	if err != nil {
+		m.setDomainSyncStatus(region, false, err.Error(), 0)
+		logging.ErrorTo("proxy", "%s: 优选域名 %s 同步失败: %v", region, fqdn, err)
+		return
+	}
+	msg := fmt.Sprintf("对齐完成：共 %d 条（新建 %d / 删除 %d）", len(ips), created, deleted)
+	m.setDomainSyncStatus(region, true, msg, len(ips))
+	logging.InfoTo("proxy", "%s: 优选域名 %s %s", region, fqdn, msg)
 }
 
 // Status 健康状态

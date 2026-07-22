@@ -475,9 +475,9 @@ example.com"></textarea>
     <div id="lib-region-toggles" class="region-toggles"></div>
   </div>
 
-  <!-- 收藏 IP 区域（从 IP 库中收藏，cfnat 代理优先使用；按排序号排列） -->
+  <!-- 收藏 IP 区域（从 IP 库中收藏，cfnat 代理优先使用；按排序号排列；每地区含优选域名同步行） -->
   <div class="card" id="lib-pinned-card">
-    <div class="card-title">⭐ 收藏 IP（从 IP 库中收藏，cfnat 代理优先使用；按顺序排列，无上限）<span class="right"><span class="hint">↑ 上移一位 / ↓ 下移一位 / ✕ 取消收藏</span></span></div>
+    <div class="card-title">⭐ 收藏 IP 与优选域名（从 IP 库中收藏，cfnat 代理优先使用；🌐 优选域名 = 收藏 IP 自动写入 Cloudflare DNS，同名多记录轮询，v4→A / v6→AAAA，灰云 ttl=60）<span class="right"><span class="hint">↑ 上移一位 / ↓ 下移一位 / ✕ 取消收藏 · CF Token / 主域名在「设置」页</span></span></div>
     <div id="lib-pinned-tbody"></div>
   </div>
 
@@ -548,6 +548,8 @@ example.com"></textarea>
     </div>
     <div class="form-row"><span class="lbl">数据目录</span><input type="text" id="set-datadir" class="w220"></div>
     <div class="form-row"><span class="lbl">API Token</span><input type="password" id="set-token" class="w220" placeholder="留空不校验"></div>
+    <div class="form-row"><span class="lbl">CF API Token</span><input type="password" id="set-cf-token" class="w220" placeholder="Cloudflare API Token（Bearer）"></div>
+    <div class="form-row"><span class="lbl">CF 主域名</span><input type="text" id="set-cf-zone" class="w220" placeholder="如 ggff.net"><span class="hint">优选域名同步用，各地区优选域名须挂在该域名下</span></div>
     <div class="form-row"><span class="lbl">容器自启</span>
       <label class="tog"><input type="checkbox" id="set-autostart"><span class="tog-sl"></span></label>
       <span class="hint">容器启动时自动开启后台扫描</span>
@@ -700,7 +702,6 @@ async function loadProxies(){
         expect_code: p.expect_code !== undefined ? p.expect_code : cfnat.expect_code,
         delay: p.delay || 300,
         domain: p.domain || 'cloudflaremirrors.com/debian',
-        use_domain_ip: p.use_domain_ip === true,
         ips: p.ips || '4',
         port: p.port || 1001,
         target_port: p.target_port || 443,
@@ -740,7 +741,6 @@ function renderProxies(){
           <div class="gi"><span class="lbl">端口</span><input type="number" value="${d.port||443}" oninput="setDraft('${esc(p.name)}','port',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">Colo</span><input type="text" value="${esc(p.code||'')}" oninput="setDraft('${esc(p.name)}','colo',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">Domain</span><input type="text" value="${esc(d.domain||'')}" oninput="setDraft('${esc(p.name)}','domain',this.value)" class="w160"></div>
-          <div class="gi"><span class="lbl">域名模式</span><label class="tog"><input type="checkbox" ${d.use_domain_ip?'checked':''} onchange="setDraft('${esc(p.name)}','use_domain_ip',this.checked)"><span class="tog-sl"></span></label></div>
           <div class="gi"><span class="lbl">延迟阈值</span><input type="number" value="${d.delay||300}" oninput="setDraft('${esc(p.name)}','delay',this.value)" class="w80"><span class="hint">ms</span></div>
           <div class="gi"><span class="lbl">TLS</span><label class="tog"><input type="checkbox" ${d.tls?'checked':''} onchange="setDraft('${esc(p.name)}','tls',this.checked)"><span class="tog-sl"></span></label></div>
           <div class="gi"><span class="lbl">IP 类型</span><select onchange="setDraft('${esc(p.name)}','ips',this.value)" class="w80"><option value="4" ${d.ips==='4'?'selected':''}>4</option><option value="6" ${d.ips==='6'?'selected':''}>6</option></select></div>
@@ -794,7 +794,7 @@ async function addProxy(){
   // 否则零值入库后 ipnum=0→扫描按 20、num=0→单拨，与表单显示不符
   const p = { name, code: code || name, port, enabled: true, fallback: true,
     tls: true, ipnum: 20, num: 5, expect_code: 200, delay: 300,
-    domain: 'cloudflaremirrors.com/debian', use_domain_ip: false,
+    domain: 'cloudflaremirrors.com/debian',
     ips: '4', target_port: 443, task: 100, random: true };
   try{
     await api('PUT', '/api/regions', proxies.concat([p]));
@@ -819,7 +819,6 @@ async function saveAllProxies(){
       expect_code: d.expect_code !== undefined ? parseInt(d.expect_code) : p.expect_code,
       delay: d.delay !== undefined ? parseInt(d.delay) : p.delay,
       domain: d.domain || p.domain,
-      use_domain_ip: d.use_domain_ip === true,
       ips: d.ips || p.ips,
       task: d.task !== undefined ? parseInt(d.task) : p.task,
       random: d.random === true,
@@ -1283,50 +1282,113 @@ function priorityBadge(p){
   return `<span class="bdg bdg-ok">#${p}</span>`;
 }
 
-function renderPinned(){
-  // 收藏 IP = priority > 0
+async function renderPinned(){
+  // 每个地区一块：🌐优选域名同步行 + 收藏表（无收藏显示占位，地区块不消失）
+  let regions = proxies;
+  if (!regions || regions.length === 0) {
+    try { regions = await api('GET', '/api/regions') || []; } catch(e){ regions = []; }
+  }
+  try { domainSyncStatus = await api('GET', '/api/domains/status') || {}; } catch(e){}
+  // 收藏 IP = priority > 0，按地区分组
   const pinned = libData.filter(e => e.priority && e.priority > 0);
-  // 按地区分组
   const groups = {};
   for (const e of pinned) {
     (groups[e.region] = groups[e.region] || []).push(e);
   }
-  const regions = Object.keys(groups).sort();
-  if (regions.length === 0) {
-    el('lib-pinned-tbody').innerHTML = '<div class="empty">尚未收藏任何 IP。在下方 IP 库表格中点击 ⭐ 收藏到此处</div>';
-    return;
-  }
-  const html = regions.map(region => {
-    const items = groups[region].sort((a,b) => a.priority - b.priority);
-    const rows = items.map((e, i) => {
-      const sb = e.source==='manual'?'bdg-info':e.source==='import'?'bdg-ok':'bdg-mute';
-      const upDisabled = i <= 0 ? 'disabled' : '';
-      const downDisabled = i >= items.length - 1 ? 'disabled' : '';
-      return `<tr>
-        <td><strong style="color:var(--brand)">#${e.priority}</strong></td>
-        <td><code>${esc(e.ip)}</code></td>
-        <td>${esc(e.colo||'--')}</td>
-        <td><strong>${e.speed_mbps?e.speed_mbps.toFixed(2)+' MB/s':'-'}</strong></td>
-        <td>${e.latency_ms?e.latency_ms.toFixed(0)+' ms':'-'}</td>
-        <td><span class="bdg ${sb}">${esc(e.source||'auto')}</span></td>
-        <td style="white-space:nowrap">
-          <button class="btn btn-success btn-sm" ${upDisabled} onclick="reorderIP('${esc(e.ip)}','${esc(e.region)}','up')" title="上移一位">↑</button>
-          <button class="btn btn-warn btn-sm" ${downDisabled} onclick="reorderIP('${esc(e.ip)}','${esc(e.region)}','down')" title="下移一位">↓</button>
-          <button class="btn btn-ghost btn-sm" onclick="unpinIP('${esc(e.ip)}','${esc(e.region)}')" title="取消收藏">✕</button>
-        </td>
-      </tr>`;
-    }).join('');
-    return `<div style="margin-bottom:12px">
+  const html = regions.map(p => {
+    const region = p.name;
+    const items = (groups[region]||[]).sort((a,b) => a.priority - b.priority);
+    const st = domainSyncStatus[region];
+    const stHtml = st
+      ? `<span style="color:${st.success?'var(--ok)':'var(--err)'}">${esc(st.time||'')} ${esc(st.message||'')}</span>`
+      : '<span style="color:var(--ink-mute)">尚未同步</span>';
+    const syncRow = `<div class="rt-row" style="margin:2px 0 8px">
+      <span class="hint">🌐 优选域名</span>
+      <input type="text" class="w220" data-pd="${esc(region)}" value="${esc(p.prefer_domain||'')}" placeholder="未设置（示例 ${region.toLowerCase()}.tunel.ggff.net）" onchange="savePreferDomain('${esc(region)}', this.value)">
+      <label class="tog" title="开启后：收藏变化约 30 秒自动对齐到该域名；收藏清空则删光该域名记录"><input type="checkbox" ${p.domain_sync!==false?'checked':''} onchange="toggleDomainSync('${esc(region)}', this.checked)"><span class="tog-sl"></span></label>
+      <button class="btn btn-primary btn-sm" onclick="manualDomainSync('${esc(region)}')" title="立即把收藏 IP 全量对齐到优选域名">⇪ 立即同步</button>
+      <span class="hint">${stHtml}</span>
+    </div>`;
+    let tableHtml;
+    if (items.length === 0) {
+      tableHtml = '<div class="empty" style="padding:8px">暂无收藏 IP（在下方 IP 库表格中点击 ⭐ 收藏）</div>';
+    } else {
+      const rows = items.map((e, i) => {
+        const sb = e.source==='manual'?'bdg-info':e.source==='import'?'bdg-ok':'bdg-mute';
+        const upDisabled = i <= 0 ? 'disabled' : '';
+        const downDisabled = i >= items.length - 1 ? 'disabled' : '';
+        return `<tr>
+          <td><strong style="color:var(--brand)">#${e.priority}</strong></td>
+          <td><code>${esc(e.ip)}</code></td>
+          <td>${esc(e.colo||'--')}</td>
+          <td><strong>${e.speed_mbps?e.speed_mbps.toFixed(2)+' MB/s':'-'}</strong></td>
+          <td>${e.latency_ms?e.latency_ms.toFixed(0)+' ms':'-'}</td>
+          <td><span class="bdg ${sb}">${esc(e.source||'auto')}</span></td>
+          <td style="white-space:nowrap">
+            <button class="btn btn-success btn-sm" ${upDisabled} onclick="reorderIP('${esc(e.ip)}','${esc(e.region)}','up')" title="上移一位">↑</button>
+            <button class="btn btn-warn btn-sm" ${downDisabled} onclick="reorderIP('${esc(e.ip)}','${esc(e.region)}','down')" title="下移一位">↓</button>
+            <button class="btn btn-ghost btn-sm" onclick="unpinIP('${esc(e.ip)}','${esc(e.region)}')" title="取消收藏">✕</button>
+          </td>
+        </tr>`;
+      }).join('');
+      tableHtml = `<div class="tbl-wrap"><table><thead><tr>
+        <th>#</th><th>IP</th><th>COLO</th><th>速度</th><th>延迟</th><th>来源</th><th>操作</th>
+      </tr></thead><tbody>${rows}</tbody></table></div>`;
+    }
+    return `<div style="margin-bottom:14px">
       <div style="font-weight:600;margin:4px 0 6px;display:flex;align-items:center;gap:8px">
         <span class="bdg bdg-brand">${esc(region)}</span>
         <span class="hint">${items.length} 个收藏</span>
       </div>
-      <div class="tbl-wrap"><table><thead><tr>
-        <th>#</th><th>IP</th><th>COLO</th><th>速度</th><th>延迟</th><th>来源</th><th>操作</th>
-      </tr></thead><tbody>${rows}</tbody></table></div>
+      ${syncRow}
+      ${tableHtml}
     </div>`;
   }).join('');
-  el('lib-pinned-tbody').innerHTML = html;
+  el('lib-pinned-tbody').innerHTML = html || '<div class="empty">请先在「代理地区」创建地区</div>';
+}
+
+// ==================== 优选域名同步 ====================
+let domainSyncStatus = {};
+
+// 整对象更新地区（HandleAPIRegion 为全量替换，必须带全字段）
+async function saveRegionFields(name, patch){
+  let p = (proxies||[]).find(x => x.name === name);
+  if (!p) {
+    const rs = await api('GET', '/api/regions') || [];
+    p = rs.find(x => x.name === name);
+  }
+  if (!p) { toast('地区不存在: '+name, 'err'); return false; }
+  await api('PUT', '/api/regions/' + encodeURIComponent(name), Object.assign({}, p, patch));
+  const lp = (proxies||[]).find(x => x.name === name);
+  if (lp) Object.assign(lp, patch);
+  return true;
+}
+
+async function savePreferDomain(name, v){
+  try{
+    if (await saveRegionFields(name, { prefer_domain: v.trim() })) toast(`${name} 优选域名已保存`);
+  } catch(e){ toast('保存失败: '+e.message, 'err'); }
+}
+
+async function toggleDomainSync(name, on){
+  try{
+    if (await saveRegionFields(name, { domain_sync: on })) toast(`${name} 自动同步已${on?'开启':'关闭'}`);
+  } catch(e){ toast('保存失败: '+e.message, 'err'); }
+}
+
+async function manualDomainSync(name){
+  try{
+    // 先把输入框当前值强制保存——onchange 保存是异步的，不先落库后端读到的还是旧值
+    const inp = document.querySelector(`input[data-pd="${name}"]`);
+    if (inp && inp.value.trim()) {
+      await saveRegionFields(name, { prefer_domain: inp.value.trim() });
+    }
+    domainSyncStatus = await api('POST', '/api/domains/sync', { region: name });
+    renderPinned();
+    const st = domainSyncStatus[name];
+    if (st && st.success) toast(`${name} ${st.message}`);
+    else toast(`${name} 同步失败: ${st?st.message:'未知错误'}`, 'err');
+  } catch(e){ toast('同步失败: '+e.message, 'err'); }
 }
 
 // 调整收藏 IP 排序（与相邻项交换位置）
@@ -1540,6 +1602,8 @@ async function loadSettings(){
     el('set-loglevel').value = g.log_level || 'info';
     setVal('set-datadir', g.data_dir || '/data');
     setVal('set-token', g.api_token || '');
+    setVal('set-cf-token', g.cf_api_token || '');
+    setVal('set-cf-zone', g.cf_zone || '');
     setChk('set-autostart', g.auto_start);
     el('set-info').innerHTML =
       `<div class="ci"><span class="l">版本</span><span class="v">1.0.0</span></div>`+
@@ -1556,6 +1620,8 @@ async function saveSettings(){
       log_level: el('set-loglevel').value,
       data_dir: val('set-datadir')||'/data',
       api_token: val('set-token'),
+      cf_api_token: val('set-cf-token'),
+      cf_zone: val('set-cf-zone'),
       auto_start: chk('set-autostart')
     });
     toast('已保存（端口修改需重启）');

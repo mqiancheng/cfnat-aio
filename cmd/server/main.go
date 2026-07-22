@@ -91,6 +91,8 @@ func main() {
 	if err := pm.Sync(); err != nil {
 		log.Printf("同步代理失败: %v", err)
 	}
+	// 启动时对齐优选域名（开启自动同步且配置了优选域名的地区）
+	pm.StartupDomainSync()
 
 	// 启动 WebUI
 	handlers := webui.New(store, cfgMgr, lib, sc, pm)
@@ -158,6 +160,9 @@ func registerRoutes(mux *http.ServeMux, h *webui.Handlers) {
 	mux.HandleFunc("/api/ips/add", h.HandleAPIIPAdd)
 	mux.HandleFunc("/api/ips/remove", h.HandleAPIIPRemove)
 	mux.HandleFunc("/api/ips/priority", h.HandleAPIIPPriority)
+	mux.HandleFunc("/api/ips/reorder", h.HandleAPIIPReorder)
+	mux.HandleFunc("/api/domains/sync", h.HandleAPIDomainSync)
+	mux.HandleFunc("/api/domains/status", h.HandleAPIDomainStatus)
 	mux.HandleFunc("/api/ips/import-probe", h.HandleAPIIPImportProbe)
 	mux.HandleFunc("/api/probe/stream", h.HandleAPIIPImportProbe)
 

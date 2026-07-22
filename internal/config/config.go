@@ -25,6 +25,8 @@ type ProxyRegion struct {
 	Fallback  bool   `json:"fallback"`   // 库中 IP 全不可用时是否自动 fallback 到全量 CF
 	UsePinned bool   `json:"use_pinned"` // 是否使用本地区收藏IP做代理（false则走cfnat兜底IP）
 	AutoSpeedtest bool `json:"auto_speedtest"` // 自动测速入库：currentIP 新上任时对其测速一次，≥min_speed 则自动入库（不收藏、不复测；默认关）
+	PreferDomain string `json:"prefer_domain"` // 优选域名：收藏 IP 同步到该域名的 A/AAAA 记录（如 hkg.tunel.ggff.net；空=不同步）
+	DomainSync  bool   `json:"domain_sync"`   // 优选域名自动同步开关：收藏变化后 30s 防抖同步（默认开）
 	IPCount   int    `json:"ip_count"`   // 当前可用 IP 数（运行时统计）
 	LastCheck string `json:"last_check"` // 上次健康检查时间
 
@@ -37,7 +39,6 @@ type ProxyRegion struct {
 	ExpectCode int   `json:"expect_code"`     // 期望 HTTP 状态码 (原 cfnat 环境变量 code=)
 	Delay     int    `json:"delay"`          // 延迟阈值 ms
 	Domain    string `json:"domain"`         // 测速 / 健康检查域名（SNI/Host）
-	UseDomainIP bool `json:"use_domain_ip"`  // 域名模式：解析 Domain 得到的多 IP 作为转发目标（DNS 需由测速脚本维护为优选 IP）
 	IPsType   string `json:"ips"`            // "4" 或 "6"
 	Task      int    `json:"task"`           // 并发数（扫描探测并发度）
 	Random    bool   `json:"random"`         // 是否随机生成候选IP（对应 cfnat-docker 的 random=）：
@@ -53,8 +54,9 @@ type ProxyRegion struct {
 func (r *ProxyRegion) UnmarshalJSON(data []byte) error {
 	type Alias ProxyRegion
 	tmp := struct {
-		Code   json.RawMessage `json:"code"`
-		Random json.RawMessage `json:"random"`
+		Code       json.RawMessage `json:"code"`
+		Random     json.RawMessage `json:"random"`
+		DomainSync json.RawMessage `json:"domain_sync"`
 		*Alias
 	}{Alias: (*Alias)(r)}
 
@@ -111,6 +113,17 @@ func (r *ProxyRegion) UnmarshalJSON(data []byte) error {
 			r.Random = true
 		}
 	}
+	// domain_sync 默认开：仅当显式 false 才关闭（旧数据无此字段时视为开启）
+	if len(tmp.DomainSync) == 0 || string(tmp.DomainSync) == "null" {
+		r.DomainSync = true
+	} else {
+		var b bool
+		if err := json.Unmarshal(tmp.DomainSync, &b); err == nil {
+			r.DomainSync = b
+		} else {
+			r.DomainSync = true
+		}
+	}
 	return nil
 }
 
@@ -164,6 +177,8 @@ type GeneralConfig struct {
 	DataDir      string `json:"data_dir"`       // 数据目录（存放 cfnat-aio.db）
 	LogLevel     string `json:"log_level"`      // debug/info/warn/error
 	AutoStart    bool   `json:"auto_start"`     // 容器启动时是否自动开启扫描和代理
+	CFAPIToken   string `json:"cf_api_token"`   // Cloudflare API Token（Bearer，优选域名同步用）
+	CFZone       string `json:"cf_zone"`        // Cloudflare 主域名（如 ggff.net）
 }
 
 // Manager 全局配置管理器（线程安全）
