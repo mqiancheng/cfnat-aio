@@ -20,6 +20,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
+	"math/rand"
 	"net"
 	"net/http"
 	"sort"
@@ -50,7 +52,84 @@ var fallbackCIDRs = []string{
 	"198.41.128.0/17",
 }
 
-// Manager 多地区代理管理器
+// 全量 CF IPv6 兜底池（IP 类型=6 时使用）
+// 来源：https://www.baipiao.eu.org/cloudflare/ips-v6
+var fallbackCIDRs6 = []string{
+	"2400:cb00::/32",
+	"2606:4700::/32",
+	"2803:f800::/32",
+	"2405:b500::/32",
+	"2405:8100::/32",
+	"2a06:98c0::/29",
+	"2c0f:f248::/32",
+}
+
+// 每个 IPv6 CIDR 抽样的地址数（IPv6 无 /24 概念，按大段随机抽样以覆盖更多边缘节点）
+const ipv6SamplesPerCIDR = 256
+
+// sampleIPv6 在 ipnet 的 host 位内随机取 n 个地址（保留网络前缀，随机化主机位）
+func sampleIPv6(ipnet *net.IPNet, n int) []string {
+	maskOnes, _ := ipnet.Mask.Size()
+	base := new(big.Int).SetBytes(ipnet.IP.Mask(ipnet.Mask).To16())
+	hostBits := 128 - maskOnes
+	if hostBits <= 0 {
+		return nil
+	}
+	max := new(big.Int).Lsh(big.NewInt(1), uint(hostBits))
+	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
+	res := make([]string, 0, n)
+	for i := 0; i < n; i++ {
+		off := new(big.Int).Rand(rng, max)
+		addr := new(big.Int).Add(base, off)
+		b := addr.Bytes()
+		ip := make(net.IP, 16)
+		copy(ip[16-len(b):], b)
+		res = append(res, ip.String())
+	}
+	return res
+}
+
+// mergePools 合并扫描新结果与旧池（对齐 cfnat-docker 的 IP 列表稳定性）：
+//   - 优先保留新鲜扫描结果（已按延迟升序）
+//   - 若当前粘性 IP(curIP) 不在新结果中，强制保留它（替换最差的一个新鲜结果），
+//     避免每次扫描把正在用的 IP 冲掉导致频繁换 IP
+//   - 补充旧池里残余的低延迟 IP（去重）
+//   - 总量截断到 capN（= IPNum），与 cfnat-docker 的列表规模一致
+func mergePools(newP, old []string, capN int, curIP string) []string {
+	seen := make(map[string]struct{}, capN)
+	out := make([]string, 0, capN)
+	add := func(ip string) {
+		if ip == "" {
+			return
+		}
+		if _, ok := seen[ip]; !ok {
+			seen[ip] = struct{}{}
+			out = append(out, ip)
+		}
+	}
+	for _, ip := range newP {
+		add(ip)
+	}
+	// 当前粘性 IP 不在新结果中时，强制保留（替换最差新鲜结果，保证不换 IP）
+	if curIP != "" {
+		if _, ok := seen[curIP]; !ok {
+			if len(out) >= capN {
+				out[capN-1] = curIP
+				seen[curIP] = struct{}{}
+			} else {
+				out = append(out, curIP)
+				seen[curIP] = struct{}{}
+			}
+		}
+	}
+	for _, ip := range old {
+		add(ip)
+	}
+	if len(out) > capN {
+		out = out[:capN]
+	}
+	return out
+}
 type Manager struct {
 	store  *config.SQLiteStore
 	lib    *iplibrary.Library
@@ -151,6 +230,20 @@ type regionListener struct {
 	// usePinned 为热切换标志：WebUI 切换"使用收藏IP"时原地更新，
 	// 运行中的 pickTarget 立即读到，无需重启监听/扫描（由 RefreshRegionIPs 维护）
 	usePinned atomic.Bool
+
+	// rrIdx 转发数（Num）负载均衡轮询计数器：每个新连接自增后取模，
+	// 在池内前 Num 个 IP 间轮转分发（与 cfnat-docker 的 num 负载均衡同义）
+	rrIdx atomic.Int64
+
+	// failStreak 健康检查连续失败计数：对齐 cfnat-docker 的 failCount<2，
+	// 必须连续 2 次失败才清空/切换当前 IP，避免单次端口抖动引发的频繁换 IP
+	failStreak atomic.Int64
+
+	// initialScanDone 标记「启动后首次扫描是否已完成」。
+	// 用于方案B：重启后先用数据库里记的老 IP 顶着（秒级可用），
+	// 等这第一次扫描跑完，再用本次扫描挑出的最优 IP 覆盖老 IP，
+	// 之后周期扫描只刷新候选池（故障备份），不再动 currentIP。
+	initialScanDone atomic.Bool
 
 	// === 粘性 IP 管理（cfnat-docker 方案）===
 	ipMgr *ipManager
@@ -340,8 +433,35 @@ func (m *Manager) startRegion(r config.ProxyRegion) *regionListener {
 		rl.ipMgr.markFallback()
 	}
 
-	// 选第一个有效 IP 作为 currentIP
-	m.selectInitialIP(rl)
+	// 重启记忆：优先复用上次关闭前使用的 IP（秒级可用，后台扫描同步进行）。
+	// 仅当该 IP 仍可达时才复用，否则回落到下方的常规选择逻辑。
+	if saved, ok := m.store.LoadRegionCurrentIP(r.Name); ok && saved != "" {
+		if m.checkValidIP(saved, r) {
+			if r.UsePinned {
+				// 收藏模式：仅当该 IP 在收藏列表内才复用
+				inPool := false
+				for _, x := range ips {
+					if x == saved {
+						inPool = true
+						break
+					}
+				}
+				if inPool {
+					rl.ipMgr.setCurrentIP(saved)
+					logging.InfoTo("proxy", "地区 %s 复用上次收藏 IP = %s", r.Name, saved)
+				}
+			} else {
+				rl.ipMgr.setCurrentIP(saved)
+				rl.ipMgr.markFallback()
+				logging.InfoTo("proxy", "地区 %s 复用上次兜底 IP = %s（后台扫描同步进行）", r.Name, saved)
+			}
+		}
+	}
+
+	// 选第一个有效 IP 作为 currentIP（仅当重启记忆未设定时才执行）
+	if rl.ipMgr.getCurrentIP() == "" {
+		m.selectInitialIP(rl)
+	}
 
 	go func() {
 		defer close(rl.done)
@@ -549,8 +669,9 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 		client.RemoteAddr().String(),
 		target, tp, src)
 
-	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	upstream, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(target, fmt.Sprintf("%d", tp)))
+	// 对齐 cfnat-docker：以当前 currentIP 为目标，并发拨 num 份取最快连接
+	// （currentIP 粘性，不再像之前那样在池内轮询不同 IP 导致连接乱跳）
+	upstream, err := m.dialBest(ctx, target, tp, r.Num)
 	if err != nil {
 		logging.WarnTo("proxy", "%s: 连接 %s:%d 失败: %v", r.Name, target, tp, err)
 		_ = m.store.MarkIPChecked(target, r.Name, false, 0, 0)
@@ -607,48 +728,93 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 // pickTarget 选取转发目标（cfnat-docker 风格：优先用 currentIP）
 // 1. 收藏 IP 有 → 用收藏 IP（currentIP 已记录）
 // 2. 收藏 IP 空 / 全挂 → 从常驻扫描维护的热兜底池取（已按 colo 筛选 + 延迟排序，零等待）
+// 3. Num>1 时：在池内前 Num 个 IP 之间轮询负载均衡（与 cfnat-docker 的 num 同义）
 func (m *Manager) pickTarget(rl *regionListener, r config.ProxyRegion) (string, bool, error) {
-	// 有 currentIP 就复用（不管来自收藏 IP 还是兜底池）
-	if cur := rl.ipMgr.getCurrentIP(); cur != "" {
-		return cur, rl.ipMgr.isFallback(), nil
-	}
-	// 当前无 IP（首连 / 上一轮耗尽）→ 从 ipMgr 列表选第一个有效（收藏或兜底池，逻辑完全一致）
-	ips := rl.ipMgr.getIPs()
-	if len(ips) == 0 {
-		// 兜底池尚未就绪（后台扫描器可能还在首次扫描中）。
-		// 不在此处同步阻塞重扫——由 regionScanLoop 异步维护热池，
-		// 避免每个连接请求都触发一次全量探测导致雪崩。
-		m.mu.Lock()
-		pool := m.fallbackPicks[r.Name]
-		m.mu.Unlock()
-		if len(pool) == 0 {
-			return "", false, fmt.Errorf("no candidates for region %s (fallback pool not ready)", r.Name)
+	// 首次 / 上一轮耗尽时，从 ipMgr 列表或兜底热池选第一个有效 IP
+	if cur := rl.ipMgr.getCurrentIP(); cur == "" {
+		ips := rl.ipMgr.getIPs()
+		if len(ips) == 0 {
+			// 兜底池尚未就绪（后台扫描器可能还在首次扫描中）。
+			// 不在此处同步阻塞重扫——由 regionScanLoop 异步维护热池，
+			// 避免每个连接请求都触发一次全量探测导致雪崩。
+			m.mu.Lock()
+			pool := m.fallbackPicks[r.Name]
+			m.mu.Unlock()
+			if len(pool) == 0 {
+				return "", false, fmt.Errorf("no candidates for region %s (fallback pool not ready)", r.Name)
+			}
+			rl.ipMgr.refresh(pool)
+			rl.ipMgr.markFallback()
+			ips = pool
 		}
-		rl.ipMgr.refresh(pool)
-		rl.ipMgr.markFallback()
-		ips = pool
-	}
-	// 选第一个可达的（与 selectInitialIP 一致）。usePinned 读原子标志，热切换即时生效。
-	usePinned := rl.usePinned.Load()
-	for _, ip := range ips {
-		if m.checkValidIP(ip, rl.region) {
-			rl.ipMgr.setCurrentIP(ip)
+		// 选第一个可达的（与 selectInitialIP 一致）。usePinned 读原子标志，热切换即时生效。
+		usePinned := rl.usePinned.Load()
+		for _, ip := range ips {
+			if m.checkValidIP(ip, rl.region) {
+				rl.ipMgr.setCurrentIP(ip)
+				if !usePinned {
+					rl.ipMgr.markFallback()
+				}
+				return ip, rl.ipMgr.isFallback(), nil
+			}
+		}
+		if len(ips) > 0 {
+			rl.ipMgr.setCurrentIP(ips[0])
 			if !usePinned {
 				rl.ipMgr.markFallback()
 			}
-			return ip, !usePinned, nil
+			logging.WarnTo("proxy", "%s: 兜底池所有 IP 验证失败，临时使用 %s", r.Name, ips[0])
+			return ips[0], rl.ipMgr.isFallback(), nil
 		}
+		return "", false, fmt.Errorf("no valid IP for region %s", r.Name)
 	}
-	if len(ips) > 0 {
-		rl.ipMgr.setCurrentIP(ips[0])
-		if !usePinned {
-			rl.ipMgr.markFallback()
-		}
-		logging.WarnTo("proxy", "%s: 兜底池所有 IP 验证失败，临时使用 %s", r.Name, ips[0])
-		return ips[0], !usePinned, nil
-	}
-	return "", false, fmt.Errorf("no valid IP for region %s", r.Name)
+	// 已有 currentIP：直接返回（Num 负载均衡由 handleConn 的 dialBest 并发拨号实现，不此处轮询）
+	return rl.ipMgr.getCurrentIP(), rl.ipMgr.isFallback(), nil
 }
+
+// dialBest 对齐 cfnat-docker 的 generateTargets + handleConnection：
+// 对同一个 currentIP 并发拨 num 份连接，取最快建连的那个用于转发。
+// currentIP 始终保持粘性，绝不在池内轮询不同 IP（这是之前 HKG 连接乱跳的根因）。
+func (m *Manager) dialBest(ctx context.Context, target string, port, num int) (net.Conn, error) {
+	addr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
+	dial := func() (net.Conn, error) {
+		d := &net.Dialer{Timeout: 5 * time.Second}
+		return d.DialContext(ctx, "tcp", addr)
+	}
+	if num <= 1 {
+		return dial()
+	}
+	type res struct {
+		conn net.Conn
+		err  error
+	}
+	ch := make(chan res, num)
+	for i := 0; i < num; i++ {
+		go func() {
+			c, err := dial()
+			ch <- res{c, err}
+		}()
+	}
+	var best net.Conn
+	for i := 0; i < num; i++ {
+		r := <-ch
+		if r.err == nil {
+			if best == nil {
+				best = r.conn
+			} else {
+				r.conn.Close()
+			}
+		}
+	}
+	if best != nil {
+		return best, nil
+	}
+	return nil, fmt.Errorf("dial %s failed", addr)
+}
+
+// 注意：AIO 严格保持 cfnat-docker 的切换逻辑 —— 只有自检(127.0.0.1:port)连续 2 次
+// 连不上时才切换 IP，没有任何"超延时就切"的功能。上面的 switchForDelay / ipUnderDelay
+// / measureTargetLatency 等延迟切换逻辑已全部移除，切勿再自行添加。
 
 // pickBestLatencyIP 从候选 IP 中按 colo + 延迟筛选最优（与旧 cfnat 一致）
 //   - r.Code 非空时：只保留数据中心匹配的 IP（通过 CF-RAY 头识别）
@@ -797,29 +963,44 @@ func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl 
 			return
 		case <-ticker.C:
 			if !m.doStatusCheck(checkAddr, r) {
-				if rl.ipMgr.isFallback() {
-					// 兜底 IP 失效 → 清空 currentIP，下次连接重新选
-					rl.ipMgr.clearCurrent()
-					logging.WarnTo("proxy", "%s: 兜底 IP 失效，下次重选", r.Name)
-				} else if !rl.ipMgr.switchToNextValidIP(func(ip string) bool {
-					return m.checkValidIP(ip, r)
-				}) {
-					// 收藏 IP 全部轮过 → 清空 currentIP 让 pickTarget 走兜底
-					rl.ipMgr.clearCurrent()
-					logging.WarnTo("proxy", "%s 所有收藏 IP 都已耗尽，将走兜底池", r.Name)
+				// 对齐 cfnat-docker：需连续 2 次失败才切换（容忍单次抖动），
+				// 单次失败只计数不动作，避免端口瞬断导致频繁换 IP。
+				streak := rl.failStreak.Add(1)
+				if streak >= 2 {
+					rl.failStreak.Store(0)
+					if rl.ipMgr.isFallback() {
+						// 兜底 IP 连续失效 → 清空 currentIP，下次连接重新选
+						rl.ipMgr.clearCurrent()
+						logging.WarnTo("proxy", "%s: 兜底 IP 连续2次失效，下次重选", r.Name)
+					} else if !rl.ipMgr.switchToNextValidIP(func(ip string) bool {
+						return m.checkValidIP(ip, r)
+					}) {
+						// 收藏 IP 全部轮过 → 清空 currentIP 让 pickTarget 走兜底
+						rl.ipMgr.clearCurrent()
+						logging.WarnTo("proxy", "%s 所有收藏 IP 都已耗尽，将走兜底池", r.Name)
+					}
+				} else {
+					logging.WarnTo("proxy", "%s: 单次健康检查失败（%d/2），暂不切换", r.Name, streak)
 				}
+			} else {
+				rl.failStreak.Store(0)
 			}
 			m.mu.Lock()
 			m.lastHealth[r.Name] = time.Now()
 			m.mu.Unlock()
 
-			// 周期性刷新当前 IP 的延迟（每 ~32 秒一次）
-			delayCheckTick++
-			if delayCheckTick >= 4 {
-				delayCheckTick = 0
-				m.refreshCurrentDelay(rl, r)
-			}
+		// 周期性刷新当前 IP 的延迟（每 ~32 秒一次）
+		delayCheckTick++
+		if delayCheckTick >= 4 {
+			delayCheckTick = 0
+			m.refreshCurrentDelay(rl, r)
 		}
+
+		// 持久化当前使用的 IP（重启记忆）：关闭程序后可优先复用，秒级可用
+		if cur := rl.ipMgr.getCurrentIP(); cur != "" {
+			_ = m.store.SaveRegionCurrentIP(r.Name, cur)
+		}
+	}
 	}
 }
 
@@ -836,17 +1017,32 @@ func (m *Manager) doStatusCheck(checkAddr string, r config.ProxyRegion) bool {
 
 // refreshCurrentDelay 对当前 IP 做 detectColo 刷新延迟（用于仪表盘展示）
 // 非阻塞：在后台跑，成功就更新 ipMgr 的 currentDelayMs
+// refreshCurrentDelay 刷新当前 IP 的延迟显示（用于 WebUI/日志）。
+//
+// 测量方式严格对齐 cfnat-docker 的 handleConnection（cfnat.go:830）：
+// 对实际代理目标端口(默认 :443)做一次纯 TCP 握手，取 time.Since(start) 作为延迟。
+// 绝不使用 :80 CF-RAY 探针（detectColo）——那是扫描阶段挑 IP 用的，与真实代理链路不同，
+// 且 HTTP 往返抖动大，会导致显示数字剧烈波动（56ms→230ms→2237ms），与 cfnat-docker 不符。
 func (m *Manager) refreshCurrentDelay(rl *regionListener, r config.ProxyRegion) {
 	cur := rl.ipMgr.getCurrentIP()
 	if cur == "" {
 		return
 	}
 	go func() {
-		_, lat := m.detectColo(cur)
-		if lat > 0 {
-			rl.ipMgr.updateDelayMs(lat.Milliseconds())
-			logging.DebugTo("proxy", "%s: 延迟刷新 %s = %dms", r.Name, cur, lat.Milliseconds())
+		tp := r.TargetPort
+		if tp <= 0 {
+			tp = 443
 		}
+		dialer := &net.Dialer{Timeout: 5 * time.Second}
+		t0 := time.Now()
+		conn, err := dialer.Dial("tcp", net.JoinHostPort(cur, fmt.Sprintf("%d", tp)))
+		if err != nil {
+			return
+		}
+		conn.Close()
+		lat := time.Since(t0).Milliseconds()
+		rl.ipMgr.updateDelayMs(lat)
+		logging.InfoTo("proxy", "%s: 延迟刷新 %s = %dms", r.Name, cur, lat)
 	}()
 }
 
@@ -866,20 +1062,34 @@ func (m *Manager) getFallbackCandidates(r config.ProxyRegion) []string {
 	samplesPer24 := 1 // 每个 /24 抽 1 个随机 IP（与旧 cfnat 一致）
 	out := make(map[string]struct{}) // 去重
 
-	for _, c := range fallbackCIDRs {
+	var cidrs []string
+	if r.IPsType == "6" {
+		cidrs = fallbackCIDRs6
+	} else {
+		cidrs = fallbackCIDRs
+	}
+
+	for _, c := range cidrs {
 		_, ipnet, err := net.ParseCIDR(c)
 		if err != nil {
 			continue
 		}
-		// 把大段拆成 /24 子网
-		subnets := expandToSlash24(ipnet)
-		for _, sub := range subnets {
-			for i := 0; i < samplesPer24; i++ {
-				offset := uint32(time.Now().UnixNano()+int64(i*1000))%254 + 1
-				ip := addOffset(sub.IP.To4(), offset)
-				if ip != nil {
-					out[ip.String()] = struct{}{}
+		if ipnet.IP.To4() != nil {
+			// IPv4：把大段拆成 /24 子网
+			subnets := expandToSlash24(ipnet)
+			for _, sub := range subnets {
+				for i := 0; i < samplesPer24; i++ {
+					offset := uint32(time.Now().UnixNano()+int64(i*1000))%254 + 1
+					ip := addOffset(sub.IP.To4(), offset)
+					if ip != nil {
+						out[ip.String()] = struct{}{}
+					}
 				}
+			}
+		} else {
+			// IPv6：随机抽 ipv6SamplesPerCIDR 个地址
+			for _, ip := range sampleIPv6(ipnet, ipv6SamplesPerCIDR) {
+				out[ip] = struct{}{}
 			}
 		}
 	}
@@ -892,8 +1102,12 @@ func (m *Manager) getFallbackCandidates(r config.ProxyRegion) []string {
 	shuffleStrings(result)
 
 	m.fallbackPicks[r.Name] = result
-	logging.InfoTo("proxy", "兜底池生成 %d 个候选 IP（%d 个 /24 × 每个抽 %d）",
-		len(result), countSlash24(fallbackCIDRs), samplesPer24)
+	if r.IPsType == "6" {
+		logging.InfoTo("proxy", "兜底池生成 %d 个 IPv6 候选 IP", len(result))
+	} else {
+		logging.InfoTo("proxy", "兜底池生成 %d 个候选 IP（%d 个 /24 × 每个抽 %d）",
+			len(result), countSlash24(fallbackCIDRs), samplesPer24)
+	}
 	return result
 }
 

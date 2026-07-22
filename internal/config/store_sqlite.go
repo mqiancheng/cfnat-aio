@@ -92,6 +92,20 @@ func (s *SQLiteStore) getKV(key string) (string, error) {
 	return v, err
 }
 
+// === 地区当前使用 IP 持久化（重启记忆）===
+// 关闭程序时记录本次代理使用的兜底 IP；重启后优先复用，实现“先代理后扫描”的秒级可用。
+func (s *SQLiteStore) SaveRegionCurrentIP(name, ip string) error {
+	return s.setKV("region_current_ip_"+name, ip)
+}
+
+func (s *SQLiteStore) LoadRegionCurrentIP(name string) (string, bool) {
+	v, err := s.getKV("region_current_ip_" + name)
+	if err != nil || v == "" {
+		return "", false
+	}
+	return v, true
+}
+
 // === ConfigStore 接口实现 ===
 
 func (s *SQLiteStore) LoadGeneral() (GeneralConfig, error) {

@@ -680,9 +680,6 @@ func (h *Handlers) HandleAPICfnatConfig(w http.ResponseWriter, r *http.Request) 
 		if c.ForwardNum < 1 {
 			c.ForwardNum = 1
 		}
-		if c.SpeedTime < 1 {
-			c.SpeedTime = 1
-		}
 		if c.ExpectCode < 100 || c.ExpectCode > 599 {
 			c.ExpectCode = 200
 		}

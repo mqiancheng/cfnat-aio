@@ -28,18 +28,17 @@ type ProxyRegion struct {
 	LastCheck string `json:"last_check"` // 上次健康检查时间
 
 	// === cfnat 转发参数（每地区独立）===
-	// 对应 cfnat-docker 环境变量: port(目标端口) tls ipnum num speedtime code delay domain ips task
+	// 对应 cfnat-docker 环境变量: port(目标端口) tls ipnum num code delay domain ips task
 	TargetPort int    `json:"target_port"` // CF 目标端口（对应 cfnat-docker 的 port=，默认 443）
 	TLS        bool   `json:"tls"`            // TLS 模式
 	IPNum     int    `json:"ipnum"`          // IP 池大小
-	Num       int    `json:"num"`            // 转发 IP 轮换数
-	SpeedTime int    `json:"speedtime"`      // 测速时长（秒）
+	Num       int    `json:"num"`            // 转发 IP 负载均衡数（并发连接轮询的 IP 数）
 	ExpectCode int   `json:"expect_code"`     // 期望 HTTP 状态码 (原 cfnat 环境变量 code=)
 	Delay     int    `json:"delay"`          // 延迟阈值 ms
 	Domain    string `json:"domain"`         // 测速 / 健康检查域名（SNI/Host）
 	UseDomainIP bool `json:"use_domain_ip"`  // 域名模式：解析 Domain 得到的多 IP 作为转发目标（DNS 需由测速脚本维护为优选 IP）
 	IPsType   string `json:"ips"`            // "4" 或 "6"
-	Task      int    `json:"task"`           // 并发数
+	Task      int    `json:"task"`           // 并发数（扫描探测并发度）
 }
 
 // UnmarshalJSON 兼容新旧两种存储格式：
@@ -113,7 +112,6 @@ type CfnatConfig struct {
 	TLSMode    bool   `json:"tls_mode"`    // TLS 连接模式 (tls)
 	IPPoolSize int    `json:"ip_pool_size"` // IP 池大小 (ipnum)
 	ForwardNum int    `json:"forward_num"` // 转发 IP 轮换数 (num)
-	SpeedTime  int    `json:"speed_time"`  // 测速时长秒 (speedtime)
 	ExpectCode int    `json:"expect_code"` // 期望 HTTP 状态码 (code)
 }
 
@@ -188,13 +186,13 @@ func (m *Manager) loadAll() error {
 		// 每个地区带独立的 cfnat 参数（合并自原 cfnat 全局配置）
 		m.regions = []ProxyRegion{
 			{Name: "HKG", Code: "HKG", Port: 1001, Enabled: true, Fallback: true, TargetPort: 443,
-				TLS: true, IPNum: 20, Num: 5, SpeedTime: 3, ExpectCode: 200,
+				TLS: true, IPNum: 20, Num: 5, ExpectCode: 200,
 				Delay: 200, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100},
 			{Name: "LAX", Code: "LAX", Port: 1002, Enabled: true, Fallback: true, TargetPort: 443,
-				TLS: true, IPNum: 20, Num: 5, SpeedTime: 3, ExpectCode: 200,
+				TLS: true, IPNum: 20, Num: 5, ExpectCode: 200,
 				Delay: 300, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100},
 			{Name: "JP",  Code: "NRT", Port: 1003, Enabled: false, Fallback: true, TargetPort: 443,
-				TLS: true, IPNum: 20, Num: 5, SpeedTime: 3, ExpectCode: 200,
+				TLS: true, IPNum: 20, Num: 5, ExpectCode: 200,
 				Delay: 250, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100},
 		}
 		_ = m.db.SaveRegions(m.regions)
@@ -231,7 +229,6 @@ func defaultCfnatConfig() CfnatConfig {
 		TLSMode:    true,
 		IPPoolSize: 10,
 		ForwardNum: 5,
-		SpeedTime:  3,
 		ExpectCode: 200,
 	}
 }

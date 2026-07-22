@@ -669,7 +669,6 @@ async function refreshDash(){
       `<div class="ci"><span class="l">TLS</span><span class="v">${cfg.tls_mode?'✓':'✗'}</span></div>`+
       `<div class="ci"><span class="l">IP 池大小</span><span class="v">${cfg.ip_pool_size||0}</span></div>`+
       `<div class="ci"><span class="l">转发数</span><span class="v">${cfg.forward_num||0}</span></div>`+
-      `<div class="ci"><span class="l">测速时长</span><span class="v">${cfg.speed_time||0}s</span></div>`+
       `<div class="ci"><span class="l">期望码</span><span class="v">${cfg.expect_code||0}</span></div>`;
 
     // scans
@@ -696,7 +695,6 @@ async function loadProxies(){
         tls: p.tls !== undefined ? p.tls : cfnat.tls_mode,
         ipnum: p.ipnum !== undefined ? p.ipnum : cfnat.ip_pool_size,
         num: p.num !== undefined ? p.num : cfnat.forward_num,
-        speedtime: p.speedtime !== undefined ? p.speedtime : cfnat.speed_time,
         expect_code: p.expect_code !== undefined ? p.expect_code : cfnat.expect_code,
         delay: p.delay || 300,
         domain: p.domain || 'cloudflaremirrors.com/debian',
@@ -746,7 +744,6 @@ function renderProxies(){
           <div class="gi"><span class="lbl">目标端口</span><input type="number" value="${d.target_port||443}" oninput="setDraft('${esc(p.name)}','target_port',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">IP池大小</span><input type="number" value="${d.ipnum||10}" oninput="setDraft('${esc(p.name)}','ipnum',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">转发数</span><input type="number" value="${d.num||5}" oninput="setDraft('${esc(p.name)}','num',this.value)" class="w80"></div>
-          <div class="gi"><span class="lbl">测速时长</span><input type="number" value="${d.speedtime||3}" oninput="setDraft('${esc(p.name)}','speedtime',this.value)" class="w80"><span class="hint">s</span></div>
           <div class="gi"><span class="lbl">期望码</span><input type="number" value="${d.expect_code||200}" oninput="setDraft('${esc(p.name)}','expect_code',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">并发</span><input type="number" value="${d.task||100}" oninput="setDraft('${esc(p.name)}','task',this.value)" class="w80"></div>
         </div>
@@ -808,7 +805,6 @@ async function saveAllProxies(){
       tls: d.tls !== undefined ? d.tls : p.tls,
       ipnum: d.ipnum !== undefined ? parseInt(d.ipnum) : p.ipnum,
       num: d.num !== undefined ? parseInt(d.num) : p.num,
-      speedtime: d.speedtime !== undefined ? parseInt(d.speedtime) : p.speedtime,
       expect_code: d.expect_code !== undefined ? parseInt(d.expect_code) : p.expect_code,
       delay: d.delay !== undefined ? parseInt(d.delay) : p.delay,
       domain: d.domain || p.domain,
