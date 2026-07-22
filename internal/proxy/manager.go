@@ -200,7 +200,7 @@ func (m *Manager) Sync() error {
 		}
 	}
 
-	// 启动 / 重启
+	// 启动 / 重启 / 热更新
 	for name, r := range desiredMap {
 		if !r.Enabled {
 			continue
@@ -209,7 +209,16 @@ func (m *Manager) Sync() error {
 		if exists && cur.region == r {
 			continue
 		}
+		if exists && !regionNeedsRestart(cur.region, r) {
+			// 仅非关键字段变化（ipnum/task/random/auto_speedtest/use_pinned 等）：
+			// 原地热更新，不重启监听/扫描、不换 currentIP
+			logging.InfoTo("proxy", "地区 %s 配置热更新（不重启、不换 IP）", name)
+			m.applyRegionConfigLocked(cur, r)
+			m.regions[name] = r
+			continue
+		}
 		if exists {
+			logging.InfoTo("proxy", "地区 %s 关键配置变化，重启监听并重选优选 IP", name)
 			cur.stop()
 			delete(m.listeners, name)
 			m.StopRegionScanner(name)
@@ -224,6 +233,65 @@ func (m *Manager) Sync() error {
 		}
 	}
 	return nil
+}
+
+// regionNeedsRestart 判断地区配置变化是否需要重启监听（对齐 cfnat-docker：改转发参数=重启进程）。
+// 需重启的关键字段（连接路径快照读取，变更必须重建监听器才生效）：
+//
+//	Port(监听端口) / Code(colo) / Delay(拨号超时) / Num(并发拨号份数) / TLS /
+//	TargetPort(目标端口) / ExpectCode(期望码) / Domain(验证域名) / IPsType(4/6)
+//
+// 其余字段均为热更新，不重启、不换 IP：
+//
+//	IPNum/Task/Random（扫描循环每轮已读实时配置）/ AutoSpeedtest（自动测速每次读实时配置）/
+//	UsePinned（走 RefreshRegionIPs 同款换池逻辑）/ Fallback（未使用的遗留字段）/
+//	IPCount/LastCheck（运行时统计）
+func regionNeedsRestart(old, new config.ProxyRegion) bool {
+	return old.Port != new.Port ||
+		old.Code != new.Code ||
+		old.Delay != new.Delay ||
+		old.Num != new.Num ||
+		old.TLS != new.TLS ||
+		old.TargetPort != new.TargetPort ||
+		old.ExpectCode != new.ExpectCode ||
+		old.Domain != new.Domain ||
+		old.IPsType != new.IPsType
+}
+
+// applyRegionConfigLocked 非关键字段变化时的原地热更新（Sync 持 m.mu 时调用）。
+// 只逐字段更新非关键项（关键字段变化走不到这里），避免整体赋值与连接路径读 rl.region 竞争。
+// use_pinned 变化时复用 RefreshRegionIPs 的换池逻辑（热切换收藏/兜底，不重启端口）。
+func (m *Manager) applyRegionConfigLocked(rl *regionListener, r config.ProxyRegion) {
+	pinnedChanged := rl.region.UsePinned != r.UsePinned
+	rl.region.IPNum = r.IPNum
+	rl.region.Task = r.Task
+	rl.region.Random = r.Random
+	rl.region.AutoSpeedtest = r.AutoSpeedtest
+	rl.region.Fallback = r.Fallback
+	rl.region.IPCount = r.IPCount
+	rl.region.LastCheck = r.LastCheck
+	rl.region.UsePinned = r.UsePinned
+	rl.usePinned.Store(r.UsePinned)
+	if !pinnedChanged {
+		return
+	}
+	// use_pinned 变化：与 RefreshRegionIPs 相同的换池+重选逻辑（已持 m.mu）
+	oldIP := rl.ipMgr.getCurrentIP()
+	ips := m.initRegionIPs(r)
+	rl.ipMgr.refresh(ips)
+	if !r.UsePinned && len(ips) > 0 {
+		rl.ipMgr.markFallback()
+	}
+	needReselect := false
+	if rl.ipMgr.getCurrentIP() == "" {
+		needReselect = true
+	} else if len(ips) > 0 && ips[0] != rl.ipMgr.getCurrentIP() {
+		needReselect = true
+		logging.InfoTo("proxy", "%s: IP 顺序有变，触发重新选择 (旧=%s, 新首选=%s)", r.Name, oldIP, ips[0])
+	}
+	if needReselect {
+		m.selectInitialIP(rl)
+	}
 }
 
 // regionListener 每个地区的代理监听器
@@ -987,6 +1055,10 @@ func (m *Manager) triggerFallbackRescan(r config.ProxyRegion) {
 	}
 	m.lastRescan[r.Name] = time.Now()
 	m.mu.Unlock()
+	// 读实时配置再扫：ipnum/task/random 热更新后，触发型重扫同样用最新参数
+	if live := m.liveRegion(r.Name); live != nil {
+		r = *live
+	}
 	go m.scanRegionFallback(context.Background(), r)
 }
 
@@ -995,6 +1067,10 @@ func (m *Manager) triggerFallbackRescan(r config.ProxyRegion) {
 // 去重原则（= 不复测）：本进程已测过 / 已在 IP 库（含收藏 IP）→ 跳过。
 // 注意：速度只决定入不入库，绝不影响 cfnat 的选 IP/换 IP 逻辑（cfnat-docker 也不看速度）。
 func (m *Manager) maybeAutoSpeedtest(r config.ProxyRegion, ip string) {
+	// 读实时配置：auto_speedtest 开关热更新后无需重启即可生效
+	if live := m.liveRegion(r.Name); live != nil {
+		r = *live
+	}
 	if ip == "" || !r.AutoSpeedtest {
 		return
 	}
