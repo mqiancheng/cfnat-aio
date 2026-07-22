@@ -669,9 +669,10 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 		client.RemoteAddr().String(),
 		target, tp, src)
 
-	// 对齐 cfnat-docker：以当前 currentIP 为目标，并发拨 num 份取最快连接
+	// 对齐 cfnat-docker：以当前 currentIP 为目标，并发拨 num 份，
+	// 用 r.Delay 当拨号超时（超过阈值的握手直接掐掉），并取延迟最低的那个用于转发。
 	// （currentIP 粘性，不再像之前那样在池内轮询不同 IP 导致连接乱跳）
-	upstream, err := m.dialBest(ctx, target, tp, r.Num)
+	upstream, err := m.dialBest(ctx, target, tp, r.Num, r.Delay)
 	if err != nil {
 		logging.WarnTo("proxy", "%s: 连接 %s:%d 失败: %v", r.Name, target, tp, err)
 		_ = m.store.MarkIPChecked(target, r.Name, false, 0, 0)
@@ -773,34 +774,51 @@ func (m *Manager) pickTarget(rl *regionListener, r config.ProxyRegion) (string, 
 }
 
 // dialBest 对齐 cfnat-docker 的 generateTargets + handleConnection：
-// 对同一个 currentIP 并发拨 num 份连接，取最快建连的那个用于转发。
+// 对同一个 currentIP 并发拨 num 份连接，用 delayMs 当拨号超时（与 cfnat-docker
+// net.DialTimeout(addr, delay) 一致，超过阈值的握手直接失败），并在成功的连接里
+// 取【延迟最低】的那个用于转发（对齐 cfnat-docker 的 bestConn/bestDelay 选优）。
 // currentIP 始终保持粘性，绝不在池内轮询不同 IP（这是之前 HKG 连接乱跳的根因）。
-func (m *Manager) dialBest(ctx context.Context, target string, port, num int) (net.Conn, error) {
+func (m *Manager) dialBest(ctx context.Context, target string, port, num, delayMs int) (net.Conn, error) {
 	addr := net.JoinHostPort(target, fmt.Sprintf("%d", port))
-	dial := func() (net.Conn, error) {
-		d := &net.Dialer{Timeout: 5 * time.Second}
-		return d.DialContext(ctx, "tcp", addr)
+	// 拨号超时对齐 cfnat-docker：以地区 delay 为准（delay<=0 时给一个保底值）
+	timeout := time.Duration(delayMs) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 5 * time.Second
+	}
+	dial := func() (net.Conn, time.Duration, error) {
+		d := &net.Dialer{Timeout: timeout}
+		t0 := time.Now()
+		c, err := d.DialContext(ctx, "tcp", addr)
+		return c, time.Since(t0), err
 	}
 	if num <= 1 {
-		return dial()
+		c, _, err := dial()
+		return c, err
 	}
 	type res struct {
-		conn net.Conn
-		err  error
+		conn  net.Conn
+		delay time.Duration
+		err   error
 	}
 	ch := make(chan res, num)
 	for i := 0; i < num; i++ {
 		go func() {
-			c, err := dial()
-			ch <- res{c, err}
+			c, d, err := dial()
+			ch <- res{c, d, err}
 		}()
 	}
+	// 收集所有结果，取延迟最低的有效连接（cfnat-docker handleConnection 的选优逻辑）
 	var best net.Conn
+	var bestDelay time.Duration
 	for i := 0; i < num; i++ {
 		r := <-ch
-		if r.err == nil {
-			if best == nil {
+		if r.err == nil && r.conn != nil {
+			if best == nil || r.delay < bestDelay {
+				if best != nil {
+					best.Close()
+				}
 				best = r.conn
+				bestDelay = r.delay
 			} else {
 				r.conn.Close()
 			}

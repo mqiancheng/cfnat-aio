@@ -138,30 +138,14 @@ func (m *Manager) scanRegionFallback(ctx context.Context, r config.ProxyRegion) 
 	}
 	wg.Wait()
 
-	// 按延迟升序（pool[0] 即最优）
+	// 按延迟升序（pool[0] 即最优），与 cfnat-docker scanIPs 的 TCP 延迟排序一致
 	sort.Slice(results, func(i, j int) bool { return results[i].lat < results[j].lat })
 
-	// 应用延迟阈值过滤（用户在 WebUI 设的"延迟阈值"=Delay ms）
-	// 只保留延迟 ≤ 阈值的节点，确保热池里全是低延迟优质 IP
-	delayThreshold := r.Delay
-	if delayThreshold > 0 {
-		filtered := results[:0]
-		for _, x := range results {
-			if x.lat <= int64(delayThreshold) {
-				filtered = append(filtered, x)
-			}
-		}
-		if len(filtered) > 0 {
-			results = filtered
-		} else if len(results) > 0 {
-			// 阈值过滤后为空（该地区物理上找不到 ≤ 阈值的节点，例如 HKG 设了 50ms 但本地扫不到）：
-			// 不再清空，保留延迟最低的一批作为兜底，同时明确告警，让用户知道阈值未达成。
-			logging.WarnTo("proxy", "地区 %s: 未找到 ≤%dms 的 %s 节点（最低 %dms），已保留延迟最低的 %d 个作为兜底",
-				r.Name, delayThreshold, r.Code, results[0].lat, len(results))
-		}
-	}
-
-	// 取前 IPNum 个（与 cfnat-docker 一致：扫描后只保留阈值数量的优选 IP 作为列表）
+	// 注意：cfnat-docker 在扫描阶段【不】按 delay 过滤 IP 池。
+	// delay 在 cfnat-docker 里仅作代理拨号超时（handleConnection 的 DialTimeout(addr, delay)），
+	// 低于 delay 的淘汰在 dialBest 拨号超时阶段完成，而非扫描期。
+	// 故此处严格对齐 cfnat-docker：仅按 ipnum 截断，不做扫描期延迟过滤。
+	// 取前 IPNum 个（与 cfnat-docker 一致：扫描后只保留指定数量的优选 IP 作为列表）
 	keep := r.IPNum
 	if keep <= 0 {
 		keep = 20
@@ -216,12 +200,8 @@ func (m *Manager) scanRegionFallback(ctx context.Context, r config.ProxyRegion) 
 	m.mu.Unlock()
 
 	if len(results) > 0 {
-		logging.InfoTo("proxy", "地区 %s 常驻扫描完成: 命中 %d 个 %s 节点（保留前 %d，最低 %dms / 最高 %dms%s）",
-			r.Name, len(m.fallbackPicks[r.Name]), r.Code, keep, results[0].lat, results[len(results)-1].lat,
-			func() string {
-				if delayThreshold > 0 { return fmt.Sprintf(", 阈值≤%dms", delayThreshold) }
-				return ""
-			}())
+		logging.InfoTo("proxy", "地区 %s 常驻扫描完成: 命中 %d 个 %s 节点（保留前 %d，最低 %dms / 最高 %dms）",
+			r.Name, len(m.fallbackPicks[r.Name]), r.Code, keep, results[0].lat, results[len(results)-1].lat)
 	} else {
 		logging.WarnTo("proxy", "地区 %s 常驻扫描: 未找到匹配 %s 的节点（兜底池为空）", r.Name, r.Code)
 	}
