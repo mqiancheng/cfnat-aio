@@ -680,11 +680,14 @@ async function refreshDash(){
 // ==================== PROXIES (合并地区+cfnat) ====================
 let proxies = [];        // 后端原始
 let proxyDrafts = {};    // 本地编辑草稿 {name: {delay,domain,...}}
+let scannerMinSpeed = 3; // 全局速度阈值（后台扫描配置 min_speed_mbps），地区"自动测速入库"旁显示用
 
 async function loadProxies(){
   try{
     proxies = await api('GET', '/api/regions') || [];
     const cfnat = await api('GET', '/api/cfnat');
+    const scanCfg = await api('GET', '/api/scanner').catch(()=>null);
+    if (scanCfg && scanCfg.min_speed_mbps > 0) scannerMinSpeed = scanCfg.min_speed_mbps;
     // 初始化草稿：每个地区自带 cfnat 参数；若未设则用全局 cfnat 兜底
     proxyDrafts = {};
     proxies.forEach(p => {
@@ -702,6 +705,7 @@ async function loadProxies(){
         task: p.task || 100,
         fallback: p.fallback !== false,
         random: p.random !== false,
+        auto_speedtest: p.auto_speedtest === true,
         colo: p.code || p.name
       };
       // 把 colo 同步回 proxies 数组（保证渲染时 p.code 有值）
@@ -745,6 +749,7 @@ function renderProxies(){
           <div class="gi"><span class="lbl">期望码</span><input type="number" value="${d.expect_code||200}" oninput="setDraft('${esc(p.name)}','expect_code',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">并发</span><input type="number" value="${d.task||100}" oninput="setDraft('${esc(p.name)}','task',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">随机IP <span class="qm" title="对应 cfnat-docker 的 random 参数：开=每个 /24 网段随机抽 1 个 IP（抽样扫描，省流量，默认）；关=穷举 CIDR 内每一个 IP（全量扫描，候选量极大、极耗资源，慎用）。">?</span></span><label class="tog"><input type="checkbox" ${d.random?'checked':''} onchange="setDraft('${esc(p.name)}','random',this.checked)"><span class="tog-sl"></span></label></div>
+          <div class="gi"><span class="lbl">自动测速入库 <span class="qm" title="开启后：地区 currentIP（正在当代理用的那一颗优选 IP）新上任时自动测速一次，≥全局速度阈值则自动入库（不收藏、同一IP不复测）；速度只决定入不入库，绝不影响选 IP/换 IP 逻辑。阈值修改：「后台扫描」页 → 速度阈值 → 保存，全局生效">?</span></span><label class="tog"><input type="checkbox" ${d.auto_speedtest?'checked':''} onchange="setDraft('${esc(p.name)}','auto_speedtest',this.checked)"><span class="tog-sl"></span></label><span class="hint">≥${scannerMinSpeed}MB/s 入库</span></div>
         </div>
       </div>
     </div>`;
@@ -816,6 +821,7 @@ async function saveAllProxies(){
       ips: d.ips || p.ips,
       task: d.task !== undefined ? parseInt(d.task) : p.task,
       random: d.random === true,
+      auto_speedtest: d.auto_speedtest === true,
       fallback: d.fallback
     });
   });

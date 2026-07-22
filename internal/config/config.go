@@ -24,6 +24,7 @@ type ProxyRegion struct {
 	Enabled   bool   `json:"enabled"`    // 是否启用
 	Fallback  bool   `json:"fallback"`   // 库中 IP 全不可用时是否自动 fallback 到全量 CF
 	UsePinned bool   `json:"use_pinned"` // 是否使用本地区收藏IP做代理（false则走cfnat兜底IP）
+	AutoSpeedtest bool `json:"auto_speedtest"` // 自动测速入库：currentIP 新上任时对其测速一次，≥min_speed 则自动入库（不收藏、不复测；默认关）
 	IPCount   int    `json:"ip_count"`   // 当前可用 IP 数（运行时统计）
 	LastCheck string `json:"last_check"` // 上次健康检查时间
 

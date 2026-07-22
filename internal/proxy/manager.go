@@ -141,6 +141,10 @@ type Manager struct {
 
 	fallbackPicks map[string][]string // region -> 当前兜底热池（常驻扫描维护，已按 colo 筛选+延迟排序）
 
+	// SpeedTestFn 自动测速入库用的测速函数（main 装配为 scanner.MeasureSpeed，避免 proxy 依赖 scanner 包）
+	SpeedTestFn func(ip, speedURL string, port, sec int) (float64, bool)
+	autoTested  map[string]bool // "region|ip" -> 本进程已自动测速过（去重防复测）
+
 	// 常驻扫描（cfnat-docker 同款 scanIPs 循环）：每个 enabled 地区一个后台 goroutine
 	scanMu           sync.Mutex                    // 保护 regionScanCancel（与 m.mu 分开，避免 Sync 死锁）
 	regionScanCancel map[string]context.CancelFunc // region -> 取消函数
@@ -162,6 +166,7 @@ func New(store *config.SQLiteStore, lib *iplibrary.Library, cfgMgr *config.Manag
 		listeners:     make(map[string]*regionListener),
 		regions:       make(map[string]config.ProxyRegion),
 		fallbackPicks:    make(map[string][]string),
+		autoTested:       make(map[string]bool),
 		regionScanCancel: make(map[string]context.CancelFunc),
 		scanInterval:     10 * time.Minute,
 		lastHealth:       make(map[string]time.Time),
@@ -246,6 +251,10 @@ type regionListener struct {
 	// 等这第一次扫描跑完，再用本次扫描挑出的最优 IP 覆盖老 IP，
 	// 之后周期扫描只刷新候选池（故障备份），不再动 currentIP。
 	initialScanDone atomic.Bool
+
+	// lastAutoTestIP 自动测速入库：上次触发时的 currentIP（仅 statusCheckLoop 访问，
+	// 换 IP 才触发，currentIP 不变不重复触发）
+	lastAutoTestIP string
 
 	// === 粘性 IP 管理（cfnat-docker 方案）===
 	ipMgr *ipManager
@@ -907,6 +916,12 @@ func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl 
 					m.switchRegionIP(r, rl)
 				}
 			}
+			// 自动测速入库：currentIP 新上任（首次选定/故障切换/重启复用/换池）才触发，
+			// 只测"正在当代理用的唯一一颗 IP"，同一 IP 只测一次（开关在地区配置里，默认关）
+			if cur := rl.ipMgr.getCurrentIP(); cur != "" && cur != rl.lastAutoTestIP {
+				rl.lastAutoTestIP = cur
+				m.maybeAutoSpeedtest(r, cur)
+			}
 			m.mu.Lock()
 			m.lastHealth[r.Name] = time.Now()
 			m.mu.Unlock()
@@ -973,6 +988,67 @@ func (m *Manager) triggerFallbackRescan(r config.ProxyRegion) {
 	m.lastRescan[r.Name] = time.Now()
 	m.mu.Unlock()
 	go m.scanRegionFallback(context.Background(), r)
+}
+
+// maybeAutoSpeedtest 自动测速入库（该地区开关开启时）：对 currentIP 测速一次，
+// 达标（>= scanner.min_speed_mbps）才入库：source="auto"、priority=0（不收藏）。
+// 去重原则（= 不复测）：本进程已测过 / 已在 IP 库（含收藏 IP）→ 跳过。
+// 注意：速度只决定入不入库，绝不影响 cfnat 的选 IP/换 IP 逻辑（cfnat-docker 也不看速度）。
+func (m *Manager) maybeAutoSpeedtest(r config.ProxyRegion, ip string) {
+	if ip == "" || !r.AutoSpeedtest {
+		return
+	}
+	key := r.Name + "|" + ip
+	m.mu.Lock()
+	if m.autoTested[key] {
+		m.mu.Unlock()
+		return
+	}
+	m.autoTested[key] = true
+	m.mu.Unlock()
+	// 已在库（含收藏 IP）→ 跳过
+	for _, e := range m.lib.ListIPs(r.Name) {
+		if e.IP == ip {
+			return
+		}
+	}
+	if m.SpeedTestFn == nil {
+		return
+	}
+	go func() {
+		sc := m.cfgMgr.Scanner()
+		speedURL := sc.SpeedTestURL
+		if speedURL == "" || speedURL == "auto" {
+			speedURL = "https://speed.cloudflare.com/__down?bytes=10485760"
+		}
+		port := sc.Port
+		if port <= 0 {
+			port = 443
+		}
+		sec := sc.SpeedTestSec
+		if sec <= 0 {
+			sec = 5
+		}
+		mbps, _ := m.SpeedTestFn(ip, speedURL, port, sec)
+		minSpeed := sc.MinSpeedMBps
+		if minSpeed <= 0 {
+			minSpeed = 3.0
+		}
+		if mbps < minSpeed {
+			logging.InfoTo("proxy", "%s: 自动测速 %s = %.1fMB/s 低于门槛 %.1fMB/s，不入库", r.Name, ip, mbps, minSpeed)
+			return
+		}
+		// 顺手测一次目标端口握手延迟作为库记录（与 refreshCurrentDelay 同口径）
+		var latMs float64
+		t0 := time.Now()
+		if c, err := (&net.Dialer{Timeout: 3 * time.Second}).Dial("tcp", net.JoinHostPort(ip, fmt.Sprintf("%d", port))); err == nil {
+			latMs = float64(time.Since(t0).Milliseconds())
+			c.Close()
+		}
+		if err := m.lib.AddIP(ip, r.Name, "auto", r.Code, mbps, latMs, "自动测速入库"); err == nil {
+			logging.InfoTo("proxy", "%s: 自动测速 %s = %.1fMB/s ≥ %.1f，已自动入库（未收藏）", r.Name, ip, mbps, minSpeed)
+		}
+	}()
 }
 
 // doStatusCheck 单次自检（移植 cfnat-docker statusCheck 的读检测，cfnat.go:743-789）：

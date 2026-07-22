@@ -84,6 +84,8 @@ func main() {
 	lib := iplibrary.New(store)
 	sc := scanner.New(store, lib, cfgMgr)
 	pm := proxy.New(store, lib, cfgMgr)
+	// 自动测速入库：复用 scanner 的测速能力（proxy 不直接依赖 scanner 包，避免循环依赖）
+	pm.SpeedTestFn = sc.MeasureSpeed
 
 	// 同步代理监听
 	if err := pm.Sync(); err != nil {
