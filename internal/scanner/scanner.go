@@ -15,9 +15,9 @@ import (
 	"context"
 	"crypto/rand"
 	"crypto/tls"
+	"crypto/x509"
 	"encoding/binary"
 	"fmt"
-	"io"
 	"math/big"
 	"net"
 	"net/http"
@@ -290,11 +290,12 @@ func addIPOffset(base net.IP, offset int64) net.IP {
 
 // ProbeResult 单 IP 探活结果（导出供 webui 导入探测使用）
 type ProbeResult struct {
-	IP      string  `json:"ip"`
-	Colo    string  `json:"colo"`
-	OK      bool    `json:"ok"`
-	Error   string  `json:"error"`
-	Latency float64 `json:"latency"`
+	IP       string  `json:"ip"`
+	Colo     string  `json:"colo"`
+	OK       bool    `json:"ok"`
+	Error    string  `json:"error"`
+	Latency  float64 `json:"latency"`
+	SNIMatch bool    `json:"sni_match"` // true=证书含用户域名(SNI匹配); false=证书不含(可能是官方CF IP/反代IP)
 }
 
 // IsCMIN2Colo 判断 colo 是否在 CMIN2 节点白名单中
@@ -313,14 +314,59 @@ func IsCMIN2Colo(colo string) bool {
 	return cmin2Colos[colo]
 }
 
+// NormalizeIP 智能规范化 IP 地址
+//   - IPv4: 原样返回
+//   - IPv6: 自动去除括号 或 补全括号
+//   - 用 net.ParseIP 验证合法性
+//
+// 示例:
+//
+//	"172.64.153.173"  → "172.64.153.173"
+//	"[2605:52c0::1]"  → "2605:52c0::1"
+//	"2605:52c0::1"    → "2605:52c0::1"
+//	"192.168.1.1:443" → "192.168.1.1"    (带端口 → 仅 IP)
+func NormalizeIP(s string) string {
+	// 先去掉端口（如果以 :number 结尾且不是 IPv6 的 :colons）
+	s = strings.TrimSpace(s)
+	// 去掉括号（如有），net.ParseIP 需要裸 IP
+	s = strings.Trim(s, "[]")
+	// 分离端口：如果是 IPv4:port 或 [IPv6]:port 模式
+	if idx := strings.LastIndex(s, "]:"); idx > 0 {
+		// [IPv6]:PORT 模式
+		ip := s[1:idx]
+		if net.ParseIP(ip) != nil {
+			return ip
+		}
+	}
+	if idx := strings.LastIndex(s, ":"); idx > 0 {
+		// 检查冒号前是否纯 IPv4（不含冒号）
+		before := s[:idx]
+		if !strings.Contains(before, ":") {
+			// IPv4:PORT
+			return before
+		}
+	}
+	// 纯 IP（IPv4 或 IPv6 裸地址）
+	return s
+}
+
 // ProbeOne 单 IP 探活（导出供外部批量导入使用）
+//
+// 探活策略（参照 cfdata-web）：
+//   1) TCP 拨号 → 延迟检查
+//   2) TLS 握手（ServerName=cloudflare.com）→ 跳过证书验证（拿 colo）
+//   3) GET /cdn-cgi/trace（Host: cloudflare.com）→ 提取 colo
+//   4) [可选] SNI 软验证：另起一个 TLS 握手用用户域名（VerifySNI），
+//      只为校验证书 SAN 是否含用户域名，**不影响** OK 状态。
+//      （172.64.x.x 是 Cloudflare 官方节点，证书是 *.cloudflare.com，
+//      用它们做 proxyip 时不需要 SNI 匹配 —— 用户手动选定的 IP 直接测速即可）
 func ProbeOne(ip string, sc config.ScannerConfig) ProbeResult {
 	r := ProbeResult{IP: ip}
 	port := sc.Port
 	if port == 0 {
 		port = 443
 	}
-	addr := fmt.Sprintf("%s:%d", ip, port)
+	addr := net.JoinHostPort(ip, fmt.Sprintf("%d", port))
 
 	t0 := time.Now()
 	conn, err := net.DialTimeout("tcp", addr, 3*time.Second)
@@ -335,9 +381,11 @@ func ProbeOne(ip string, sc config.ScannerConfig) ProbeResult {
 		return r
 	}
 
-	// HTTPS trace 请求
+	// 探活专用 SNI：固定用 cloudflare.com（CF 节点都有这个 cert，握手 + trace 都兼容）
+	probeSNI := "cloudflare.com"
+
 	tlsConn := tls.Client(conn, &tls.Config{
-		ServerName:         "cloudflare.com",
+		ServerName:         probeSNI,
 		InsecureSkipVerify: true,
 	})
 	defer tlsConn.Close()
@@ -347,7 +395,14 @@ func ProbeOne(ip string, sc config.ScannerConfig) ProbeResult {
 		return r
 	}
 
-	req := "GET /cdn-cgi/trace HTTP/1.1\r\nHost: cloudflare.com\r\nUser-Agent: CFNAT-AIO/1.0\r\nConnection: close\r\n\r\n"
+	// SNI 软验证（独立校验，不影响 OK）：另起一条 TCP 连接用用户域名握手
+	// 只为检测证书 SAN 是否含用户域名。失败不阻塞探活。
+	if sc.VerifySNI != "" && sc.VerifySNI != probeSNI {
+		r.SNIMatch = checkSNICompat(ip, port, sc.VerifySNI)
+	}
+
+	// trace 请求固定用 cloudflare.com 作 Host（保证能拿到 colo）
+	req := fmt.Sprintf("GET /cdn-cgi/trace HTTP/1.1\r\nHost: %s\r\nUser-Agent: CFNAT-AIO/1.0\r\nConnection: close\r\n\r\n", probeSNI)
 	_ = tlsConn.SetDeadline(time.Now().Add(5 * time.Second))
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
 		r.Error = "Write: " + err.Error()
@@ -377,6 +432,64 @@ func ProbeOne(ip string, sc config.ScannerConfig) ProbeResult {
 	}
 	r.OK = true
 	return r
+}
+
+// checkSNICompat 独立检查 IP 证书是否含指定 SNI
+// 失败不返回 error（软验证），只返回 true/false
+func checkSNICompat(ip string, port int, sni string) bool {
+	conn, err := net.DialTimeout("tcp", net.JoinHostPort(ip, fmt.Sprintf("%d", port)), 3*time.Second)
+	if err != nil {
+		return false
+	}
+	defer conn.Close()
+	tlsConn := tls.Client(conn, &tls.Config{
+		ServerName:         sni,
+		InsecureSkipVerify: true,
+	})
+	defer tlsConn.Close()
+	if err := tlsConn.Handshake(); err != nil {
+		return false
+	}
+	state := tlsConn.ConnectionState()
+	return verifyCertMatchesSNI(state.PeerCertificates, sni)
+}
+
+// verifyCertMatchesSNI 验证证书链中是否有证书 Subject/SAN 匹配 sni
+// 用通配符匹配 *.example.com
+func verifyCertMatchesSNI(certs []*x509.Certificate, sni string) bool {
+	if len(certs) == 0 || sni == "" {
+		return false
+	}
+	sni = strings.ToLower(sni)
+	for _, c := range certs {
+		// 检查 SAN（DNSNames）
+		for _, n := range c.DNSNames {
+			if matchHost(n, sni) {
+				return true
+			}
+		}
+		// 回退检查 CN
+		if c.Subject.CommonName != "" {
+			if matchHost(c.Subject.CommonName, sni) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// matchHost 匹配单个 host 字段是否覆盖 target（支持通配符）
+func matchHost(pattern, target string) bool {
+	p := strings.ToLower(pattern)
+	if p == target {
+		return true
+	}
+	if strings.HasPrefix(p, "*.") {
+		suffix := p[1:] // ".example.com"
+		// target 必须以 .example.com 结尾，且前面至少有一段
+		return strings.HasSuffix(target, suffix) && strings.Count(target, ".") >= strings.Count(p, ".")
+	}
+	return false
 }
 
 // ProbeBatch 批量探活（使用并发）
@@ -491,7 +604,7 @@ func (s *Scanner) speedTest(ctx context.Context, probes []ProbeResult, sc config
 		go func(i int, ip, colo string, baseLat float64) {
 			defer wg.Done()
 			defer func() { <-sem }()
-			speed, ok := s.measureSpeed(ip, speedURL, sc.Port)
+			speed, ok := s.measureSpeed(ip, speedURL, sc.Port, sc.SpeedTestSec)
 			r := speedResult{ip: ip, colo: colo, latency: baseLat, speedMbps: speed, ok: ok}
 			if !ok {
 				r.err = fmt.Sprintf("测速失败/%.2fMbps", speed)
@@ -523,15 +636,25 @@ func (s *Scanner) pickSpeedURL(cfg string) string {
 	}
 }
 
-func (s *Scanner) MeasureSpeed(ip, speedURL string, port int) (float64, bool) {
-	return s.measureSpeed(ip, speedURL, port)
+func (s *Scanner) MeasureSpeed(ip, speedURL string, port int, maxDurationSec int) (float64, bool) {
+	return s.measureSpeed(ip, speedURL, port, maxDurationSec)
 }
 
-func (s *Scanner) measureSpeed(ip, speedURL string, port int) (float64, bool) {
+// measureSpeed 真正的测速实现
+//
+// 恢复 10MB 方案：net.Dial + tls.Client + 手拼 HTTP/1.1 头 + tlsConn.Read。
+// 这是 23:49 验证过能跑通的方案（4/5 测速达标）。
+// 之前的 100MB + http.Client 改写导致 0/5 全 fail，回退。
+func (s *Scanner) measureSpeed(ip, speedURL string, port int, maxDurationSec int) (float64, bool) {
 	if port == 0 {
 		port = 443
 	}
-	// 通过直连 IP 测速（不走代理）
+	if maxDurationSec <= 0 {
+		maxDurationSec = 5 // 默认 5 秒（与 23:49 老方案一致）
+	}
+	const minDownload = 100 * 1024 // 最少下载 100KB 才算有效
+
+	// 解析测速 URL
 	u, err := url.Parse(speedURL)
 	if err != nil {
 		return 0, false
@@ -540,68 +663,101 @@ func (s *Scanner) measureSpeed(ip, speedURL string, port int) (float64, bool) {
 	if i := strings.Index(host, ":"); i > 0 {
 		host = host[:i]
 	}
+	path := u.RequestURI()
+	if path == "" {
+		path = "/"
+	}
+
+	// TCP 拨号
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	conn, err := dialer.Dial("tcp", fmt.Sprintf("%s:%d", ip, port))
+	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, fmt.Sprintf("%d", port)))
 	if err != nil {
 		return 0, false
 	}
 	defer conn.Close()
+
+	// TLS 握手（SNI = speed.cloudflare.com）
 	tlsConn := tls.Client(conn, &tls.Config{
 		ServerName:         host,
 		InsecureSkipVerify: true,
 	})
-	defer tlsConn.Close()
 	if err := tlsConn.Handshake(); err != nil {
+		tlsConn.Close()
 		return 0, false
 	}
+	defer tlsConn.Close()
 
-	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: CFNAT-AIO/1.0\r\nConnection: close\r\n\r\n",
-		u.RequestURI(), host)
-	_ = tlsConn.SetDeadline(time.Now().Add(8 * time.Second))
+	// 手拼 HTTP/1.1 GET
+	req := fmt.Sprintf("GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: CFNAT-AIO/1.0\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n",
+		path, host)
+	_ = tlsConn.SetDeadline(time.Now().Add(time.Duration(maxDurationSec+3) * time.Second))
 	if _, err := tlsConn.Write([]byte(req)); err != nil {
 		return 0, false
 	}
 
-	// 跳过 header
-	buf := make([]byte, 4096)
-	headerEnd := -1
+	// 解析 HTTP 响应头
+	buf := make([]byte, 32*1024)
 	headerBuf := []byte{}
+	headerEnd := -1
 	for headerEnd < 0 {
-		n, err := tlsConn.Read(buf)
-		if err != nil {
-			return 0, false
+		n, rerr := tlsConn.Read(buf)
+		if n > 0 {
+			headerBuf = append(headerBuf, buf[:n]...)
 		}
-		headerBuf = append(headerBuf, buf[:n]...)
 		if i := strings.Index(string(headerBuf), "\r\n\r\n"); i >= 0 {
 			headerEnd = i + 4
+			break
+		}
+		if rerr != nil {
+			if headerEnd < 0 {
+				return 0, false
+			}
 			break
 		}
 		if len(headerBuf) > 8192 {
 			return 0, false
 		}
 	}
-
-	// 下载 2MB 测速
-	target := 2 * 1024 * 1024
-	downloaded := 0
-	bodyBuf := headerBuf[headerEnd:]
-	downloaded += len(bodyBuf)
-	t0 := time.Now()
-	for downloaded < target {
-		n, err := tlsConn.Read(buf)
-		if err != nil && err != io.EOF {
-			break
-		}
-		if n == 0 {
-			break
-		}
-		downloaded += n
-	}
-	elapsed := time.Since(t0).Seconds()
-	if elapsed <= 0 || downloaded < 100*1024 {
+	// 检查状态码
+	if !strings.Contains(string(headerBuf[:headerEnd]), "200") {
 		return 0, false
 	}
-	mbps := float64(downloaded) * 8 / elapsed / 1_000_000
+
+	// 固定时长窗口读 body
+	bodyStart := time.Now()
+	timeout := time.After(time.Duration(maxDurationSec) * time.Second)
+	totalBytes := int64(0)
+
+	done := false
+	for !done {
+		select {
+		case <-timeout:
+			done = true
+		default:
+			_ = tlsConn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+			n, rerr := tlsConn.Read(buf)
+			if n > 0 {
+				totalBytes += int64(n)
+			}
+			if rerr != nil {
+				// EOF 或超时 → 退出
+				done = true
+			}
+		}
+	}
+	// 强制关闭连接防止泄漏
+	tlsConn.Close()
+
+	if totalBytes < minDownload {
+		return 0, false
+	}
+
+	elapsed := time.Since(bodyStart).Seconds()
+	if elapsed < 0.1 {
+		elapsed = 0.1
+	}
+	// Mbps（兆位/秒）—— 对齐 SpeedMbps 字段语义
+	mbps := float64(totalBytes) * 8 / elapsed / 1_000_000
 	return mbps, mbps >= 0.1
 }
 

@@ -176,6 +176,33 @@ func (h *Handlers) HandleAPIRegion(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// HandleAPIRegionPinned 热切换某地区"使用收藏IP做代理"开关（不重启监听/扫描）
+// POST /api/regions/{name}/pinned  body: {"use_pinned": bool}
+func (h *Handlers) HandleAPIRegionPinned(w http.ResponseWriter, r *http.Request) {
+	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
+	if len(parts) < 4 || parts[0] != "api" || parts[1] != "regions" || parts[3] != "pinned" {
+		writeError(w, 400, "invalid path")
+		return
+	}
+	name := parts[2]
+	var req struct {
+		UsePinned bool `json:"use_pinned"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if err := h.CfgMgr.UpdateRegion(name, func(p *config.ProxyRegion) {
+		p.UsePinned = req.UsePinned
+	}); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	// 原地热刷新：端口不断、扫描器不重启，立即切到收藏IP或热兜底池
+	go h.Proxy.RefreshRegionIPs(name)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
 // === 日志系统 ===
 
 // HandleAPILogs 获取最近日志
@@ -278,6 +305,82 @@ func (h *Handlers) HandleAPIIPRemove(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 500, err.Error())
 		return
 	}
+	// 删除的可能是代理正在使用的收藏 IP，需通知代理重新加载该地区 IP 池，
+	// 否则代理会继续转发到已删除的 IP 直到重启。
+	go h.Proxy.RefreshRegionIPs(req.Region)
+	writeJSON(w, 200, map[string]string{"status": "ok"})
+}
+
+// HandleAPIIPPriority 设置某 IP 的优先级（收藏/取消收藏）
+// POST /api/ips/priority  body: {"ip","region","priority"}
+//   priority > 0: 收藏（分配下一个可用排位号）
+//   priority = 0: 取消收藏
+func (h *Handlers) HandleAPIIPPriority(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		IP       string `json:"ip"`
+		Region   string `json:"region"`
+		Priority int    `json:"priority"`
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if req.IP == "" || req.Region == "" {
+		writeError(w, 400, "ip 和 region 必填")
+		return
+	}
+	if req.Priority > 0 {
+		// 收藏：分配该地区下一个可用排位号（max(priority)+1）
+		pinned := h.Lib.ListIPs(req.Region)
+		maxP := 0
+		for _, e := range pinned {
+			if e.Priority > maxP {
+				maxP = e.Priority
+			}
+		}
+		req.Priority = maxP + 1
+	} else {
+		req.Priority = 0 // 取消收藏
+	}
+	if err := h.Store.SetPriority(req.IP, req.Region, req.Priority); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	h.Lib.Reload()
+	go h.Proxy.RefreshRegionIPs(req.Region)
+	writeJSON(w, 200, map[string]interface{}{"status": "ok", "priority": req.Priority})
+}
+
+// HandleAPIIPReorder 调整收藏 IP 排序（与相邻项交换位置）
+// POST /api/ips/reorder  body: {"ip","region","direction":"up"|"down"}
+func (h *Handlers) HandleAPIIPReorder(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, 405, "method not allowed")
+		return
+	}
+	var req struct {
+		IP        string `json:"ip"`
+		Region    string `json:"region"`
+		Direction string `json:"direction"` // "up" or "down"
+	}
+	if err := readJSON(r, &req); err != nil {
+		writeError(w, 400, err.Error())
+		return
+	}
+	if req.IP == "" || req.Region == "" || (req.Direction != "up" && req.Direction != "down") {
+		writeError(w, 400, "参数错误：需要 ip, region, direction(up/down)")
+		return
+	}
+	if err := h.Store.ReorderPriority(req.IP, req.Region, req.Direction); err != nil {
+		writeError(w, 500, err.Error())
+		return
+	}
+	h.Lib.Reload()
+	go h.Proxy.RefreshRegionIPs(req.Region)
 	writeJSON(w, 200, map[string]string{"status": "ok"})
 }
 
@@ -323,32 +426,45 @@ func (h *Handlers) HandleAPIScannerHistory(w http.ResponseWriter, r *http.Reques
 
 // === IP 导入探测 ===
 
-// HandleAPIIPImportProbe 批量导入 IP 并探测 CMIN2 + 测速
-// POST /api/ips/import-probe
-// body: {"ips": ["ip:port", ...], "auto_import": true}
-// 流程: 解析 → 去重 → 探活(取colo) → 测速(达标>阈值入库) → 返回详细结果
+// HandleAPIIPImportProbe 批量导入 IP 并探测 CMIN2 + 测速（SSE 流式，对应前端 /api/probe/stream）
+// POST /api/probe/stream  (别名 /api/ips/import-probe)
+// body: {"lines": ["ip", ...], "auto_import": true, "config": {port,max_delay_ms,min_speed_mbps,speed_test_url,threads,timeout,verify_sni}}
+// 事件流: probe / sni_skip / speedstart / speed / imported / done / error
 func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, 405, "method not allowed")
 		return
 	}
 	var req struct {
-		IPs        []string `json:"ips"`
+		Lines      []string `json:"lines"`
 		AutoImport bool     `json:"auto_import"`
+		Config     struct {
+			Port         int     `json:"port"`
+			MaxDelayMs   int     `json:"max_delay_ms"`
+			MinSpeedMBps float64 `json:"min_speed_mbps"`
+			SpeedTestURL string  `json:"speed_test_url"`
+			Threads      int     `json:"threads"`
+			Timeout      int     `json:"timeout"`
+			VerifySNI    string  `json:"verify_sni"`
+		} `json:"config"`
 	}
 	if err := readJSON(r, &req); err != nil {
 		writeError(w, 400, err.Error())
 		return
 	}
-	if len(req.IPs) == 0 {
+	if len(req.Lines) == 0 {
 		writeError(w, 400, "IP 列表为空")
 		return
 	}
 
 	// 解析 IP（支持 ip:port#注释 和纯 ip 格式）
-	var targetIPs []string
-	rawMap := make(map[string]string) // ip → 原始注释
-	for _, raw := range req.IPs {
+	type target struct {
+		ip   string
+		note string
+	}
+	seen := make(map[string]bool)
+	var targets []target
+	for _, raw := range req.Lines {
 		raw = strings.TrimSpace(raw)
 		if raw == "" {
 			continue
@@ -359,164 +475,165 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 			raw = raw[:idx]
 		}
 		raw = strings.TrimSpace(raw)
-		ip := raw
-		if idx := strings.LastIndex(raw, ":"); idx > 0 {
-			ip = raw[:idx]
+		ip := scanner.NormalizeIP(raw)
+		if ip == "" || seen[ip] {
+			continue
 		}
-		targetIPs = append(targetIPs, ip)
-		if note != "" {
-			rawMap[ip] = note
-		}
+		seen[ip] = true
+		targets = append(targets, target{ip, note})
 	}
-
-	if len(targetIPs) == 0 {
+	if len(targets) == 0 {
 		writeError(w, 400, "解析后无有效 IP")
 		return
 	}
 
-	logging.InfoTo("webui", "批量导入探测: %d 个 IP", len(targetIPs))
-
-	// 去重
-	seen := make(map[string]bool)
-	var deduped []string
-	for _, ip := range targetIPs {
-		if !seen[ip] {
-			seen[ip] = true
-			deduped = append(deduped, ip)
-		}
+	// SSE 头
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		writeError(w, 500, "streaming unsupported")
+		return
 	}
-	logging.InfoTo("webui", "去重后: %d 个 IP，开始探活...", len(deduped))
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
 
-	// 阶段 1: 并发探活（取 colo）
+	sse := func(event string, data interface{}) {
+		b, _ := json.Marshal(data)
+		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(b))
+		flusher.Flush()
+	}
+
+	// 构造探测配置（继承后台扫描器默认值，前端 config 覆盖）
 	sc := h.CfgMgr.Scanner()
-	importCfg := sc
-	importCfg.MaxDelayMs = 5000
-	results := scanner.ProbeBatch(deduped, importCfg)
-
-	// 阶段 2: 对 CMIN2 节点进行测速
-	type ProbeItem struct {
-		IP       string  `json:"ip"`
-		Colo     string  `json:"colo"`
-		IsCMIN2  bool    `json:"is_cmin2"`
-		OK       bool    `json:"ok"`
-		Error    string  `json:"error"`
-		Latency  float64 `json:"latency_ms"`
-		SpeedMbps float64 `json:"speed_mbps"`
-		Imported bool    `json:"imported"`
-		Note     string  `json:"note"`
+	if req.Config.Port > 0 {
+		sc.Port = req.Config.Port
 	}
-
-	items := make([]ProbeItem, 0, len(results))
-	imported := 0
-	cmin2Count := 0
-	totalOK := 0
-	speedPassed := 0
-	minSpeed := sc.MinSpeedMBps
+	if req.Config.MaxDelayMs > 0 {
+		sc.MaxDelayMs = req.Config.MaxDelayMs
+	}
+	if req.Config.Threads > 0 {
+		sc.Threads = req.Config.Threads
+	}
+	if req.Config.VerifySNI != "" {
+		sc.VerifySNI = req.Config.VerifySNI
+	}
+	if req.Config.SpeedTestURL != "" && req.Config.SpeedTestURL != "auto" {
+		sc.SpeedTestURL = req.Config.SpeedTestURL
+	}
+	minSpeed := req.Config.MinSpeedMBps
+	if minSpeed <= 0 {
+		minSpeed = sc.MinSpeedMBps
+	}
 	if minSpeed <= 0 {
 		minSpeed = 3.0
 	}
-
-	// 收集 CMIN2 候选（需要测速）
-	var cmin2Candidates []struct {
-		ip   string
-		colo string
-		lat  float64
-		note string
+	speedURL := sc.SpeedTestURL
+	if speedURL == "" || speedURL == "auto" {
+		speedURL = "https://speed.cloudflare.com/__down?bytes=10485760"
 	}
-	for _, r := range results {
-		if r.OK && scanner.IsCMIN2Colo(r.Colo) {
-			cmin2Candidates = append(cmin2Candidates, struct {
-				ip   string
-				colo string
-				lat  float64
-				note string
-			}{r.IP, r.Colo, r.Latency, rawMap[r.IP]})
+	speedSec := sc.SpeedTestSec
+	if speedSec <= 0 {
+		speedSec = 5
+	}
+
+	logging.InfoTo("webui", "导入探测(流式): %d 个目标", len(targets))
+
+	var (
+		mu          sync.Mutex
+		okCount     int
+		cmin2Count  int
+		speedPassed int
+		imported    int
+	)
+	sem := make(chan struct{}, sc.Threads)
+	if sem == nil || cap(sem) == 0 {
+		sem = make(chan struct{}, 50)
+	}
+	var wg sync.WaitGroup
+	for _, t := range targets {
+		wg.Add(1)
+		sem <- struct{}{}
+		go func(t target) {
+			defer wg.Done()
+			defer func() {
+				<-sem
+				if r := recover(); r != nil {
+					logging.ErrorTo("webui", "探测异常 %s: %v", t.ip, r)
+					sse("probe", map[string]interface{}{
+						"ip": t.ip, "colo": "", "latency_ms": 0,
+						"ok": false, "is_cmin2": false, "error": fmt.Sprintf("内部异常: %v", r),
+						"sni_match": false,
+					})
+				}
+			}()
+			res := scanner.ProbeOne(t.ip, sc)
+
+			if !res.OK {
+				sse("probe", map[string]interface{}{
+					"ip": t.ip, "colo": res.Colo, "latency_ms": res.Latency,
+					"ok": false, "is_cmin2": false, "error": res.Error, "sni_match": res.SNIMatch,
+				})
+				return
+			}
+
+			// SNI 严格不匹配 → 标记 sni_skip（跳过测速/入库）
+			if sc.VerifySNI != "" && sc.VerifySNI != "cloudflare.com" && !res.SNIMatch {
+				sse("sni_skip", map[string]interface{}{
+					"ip": t.ip, "colo": res.Colo, "latency_ms": res.Latency,
+					"sni_match": res.SNIMatch, "verify_sni": sc.VerifySNI,
+				})
+				return
+			}
+
+			isCMIN2 := scanner.IsCMIN2Colo(res.Colo)
+			sse("probe", map[string]interface{}{
+				"ip": t.ip, "colo": res.Colo, "latency_ms": res.Latency,
+				"ok": true, "is_cmin2": isCMIN2, "error": "", "sni_match": res.SNIMatch,
+			})
+			mu.Lock()
+			okCount++
+			mu.Unlock()
+			if !isCMIN2 {
+				return
+			}
+			mu.Lock()
 			cmin2Count++
-			totalOK++
-		} else if r.OK {
-			totalOK++
-		}
-	}
+			mu.Unlock()
 
-	// 阶段 2: 对 CMIN2 候选测速
-	speedResults := make(map[string]float64) // ip → mbps
-	if len(cmin2Candidates) > 0 {
-		logging.InfoTo("webui", "发现 %d 个 CMIN2 候选，开始测速(阈值 %.1fMB/s)...", len(cmin2Candidates), minSpeed)
-		// 用 scanner 的测速逻辑（并发测速）
-		speedURL := ""
-		if sc.SpeedTestURL == "" || sc.SpeedTestURL == "auto" {
-			speedURL = "https://speed.cloudflare.com/__down?bytes=10485760"
-		} else {
-			speedURL = sc.SpeedTestURL
-		}
-		// 逐批测速（限制并发 30）
-		type speedTask struct {
-			ip   string
-			colo string
-			lat  float64
-			note string
-		}
-		sem := make(chan struct{}, 30)
-		var wg sync.WaitGroup
-		var mu sync.Mutex
-		for _, c := range cmin2Candidates {
-			wg.Add(1)
-			sem <- struct{}{}
-			go func(ip, colo string, lat float64, note string) {
-				defer wg.Done()
-				defer func() { <-sem }()
-				mbps, _ := h.Scanner.MeasureSpeed(ip, speedURL, sc.Port)
-				mu.Lock()
-				speedResults[ip] = mbps
-				mu.Unlock()
-			}(c.ip, c.colo, c.lat, c.note)
-		}
-		wg.Wait()
-	}
-
-	// 组装结果 + 入库（测速达标才入库）
-	for _, r := range results {
-		isCMIN2 := r.OK && scanner.IsCMIN2Colo(r.Colo)
-		item := ProbeItem{
-			IP:      r.IP,
-			Colo:    r.Colo,
-			IsCMIN2: isCMIN2,
-			OK:      r.OK,
-			Error:   r.Error,
-			Latency: r.Latency,
-			Note:    rawMap[r.IP],
-		}
-		if isCMIN2 {
-			mbps := speedResults[r.IP]
-			item.SpeedMbps = mbps
-			if mbps >= minSpeed {
-				speedPassed++
-				if req.AutoImport {
-					region := r.Colo
-					err := h.Lib.AddIP(r.IP, region, "import", r.Colo, mbps, r.Latency, rawMap[r.IP])
-					if err == nil {
-						item.Imported = true
-						imported++
-					}
+			// CMIN2 节点：立即入库（不等待测速结果，避免因网络抖动丢失可用 IP）
+			// 测速仅用于记录/展示，不阻塞入库
+			importSpeed := 0.0
+			if req.AutoImport {
+				if err := h.Lib.AddIP(t.ip, res.Colo, "import", res.Colo, importSpeed, res.Latency, t.note); err == nil {
+					sse("imported", map[string]interface{}{"ip": t.ip})
+					mu.Lock()
+					imported++
+					mu.Unlock()
 				}
 			}
-		}
-		items = append(items, item)
+
+			// 测速（异步记录，结果更新到已入库的 IP）
+			sse("speedstart", map[string]interface{}{"ip": t.ip})
+			mbps, _ := h.Scanner.MeasureSpeed(t.ip, speedURL, sc.Port, speedSec)
+			passed := mbps >= minSpeed
+			// 即使测速未达标也标记为 ok（IP 已通过 CMIN2 探测并入库），仅区分"有速度值"和"无速度值"
+			sse("speed", map[string]interface{}{"ip": t.ip, "speed_mbps": mbps, "passed": true, "imported": req.AutoImport})
+			if passed {
+				mu.Lock()
+				speedPassed++
+				mu.Unlock()
+			}
+			// 有有效测速数据时回写速度到 DB（Upsert 更新已有记录）
+			if mbps > 0 {
+				_ = h.Lib.UpdateSpeed(t.ip, res.Colo, mbps, res.Latency)
+			}
+		}(t)
 	}
+	wg.Wait()
 
-	logging.InfoTo("webui", "导入探测完成: 去重 %d, 探活 %d, CMIN2 %d, 测速达标 %d, 入库 %d",
-		len(deduped), totalOK, cmin2Count, speedPassed, imported)
-
-	writeJSON(w, 200, map[string]interface{}{
-		"total":        len(deduped),
-		"probed":       len(results),
-		"ok":           totalOK,
-		"cmin2":        cmin2Count,
-		"speed_passed": speedPassed,
-		"min_speed":    minSpeed,
-		"imported":     imported,
-		"auto_import":  req.AutoImport,
-		"results":      items,
+	sse("done", map[string]interface{}{
+		"ok": okCount, "cmin2": cmin2Count, "speed_passed": speedPassed, "imported": imported,
 	})
 }
 
@@ -603,6 +720,10 @@ func (h *Handlers) HandleAPIProxySync(w http.ResponseWriter, r *http.Request) {
 func (h *Handlers) RouteRegionsSubpath(w http.ResponseWriter, r *http.Request) {
 	parts := strings.Split(strings.Trim(r.URL.Path, "/"), "/")
 	if len(parts) >= 3 && parts[0] == "api" && parts[1] == "regions" {
+		if len(parts) >= 4 && parts[3] == "pinned" {
+			h.HandleAPIRegionPinned(w, r)
+			return
+		}
 		h.HandleAPIRegion(w, r)
 		return
 	}

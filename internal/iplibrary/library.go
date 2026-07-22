@@ -51,8 +51,15 @@ func (l *Library) reload() {
 	defer l.mu.Unlock()
 	l.cache = make(map[string][]string)
 	for region, list := range tmp {
-		// 按速度降序
+		// 收藏 IP（priority>0）排前面，按排位号升序；其余按速度降序
 		sort.Slice(list, func(i, j int) bool {
+			pi, pj := normPriority(list[i].Priority), normPriority(list[j].Priority)
+			if pi != pj {
+				return pi > pj // 收藏的在前
+			}
+			if pi > 0 {
+				return list[i].Priority < list[j].Priority // 收藏内按排位号升序
+			}
 			return list[i].SpeedMbps > list[j].SpeedMbps
 		})
 		ips := make([]string, 0, len(list))
@@ -61,6 +68,31 @@ func (l *Library) reload() {
 		}
 		l.cache[region] = ips
 	}
+}
+
+// normPriority 将 0 视为未收藏
+func normPriority(p int) int {
+	if p <= 0 {
+		return 0
+	}
+	return p
+}
+
+// Reload 重新从 DB 加载缓存（外部修改优先级后调用）
+func (l *Library) Reload() {
+	l.reload()
+}
+
+// CountPinned 统计某地区收藏 IP 数（priority<=2）
+func (l *Library) CountPinned(region string) int {
+	entries := l.ListIPs(region)
+	n := 0
+	for _, e := range entries {
+		if normPriority(e.Priority) <= 2 {
+			n++
+		}
+	}
+	return n
 }
 
 // AddIP 添加 IP（来源：auto/manual/import）
@@ -81,6 +113,15 @@ func (l *Library) AddIP(ip, region, source, colo string, speed, latency float64,
 			ip, region, source, colo, speed)
 	} else {
 		logging.ErrorTo("iplibrary", "添加 IP %s 失败: %v", ip, err)
+	}
+	return err
+}
+
+// UpdateSpeed 更新已有 IP 的速度/延迟（不重置其他字段）
+func (l *Library) UpdateSpeed(ip, region string, speed, latency float64) error {
+	err := l.store.UpdateSpeedIP(ip, region, speed, latency)
+	if err == nil {
+		l.reload()
 	}
 	return err
 }

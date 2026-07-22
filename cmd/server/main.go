@@ -34,7 +34,7 @@ import (
 
 var (
 	dbPath = flag.String("db", "/data/cfnat-aio.db", "SQLite 数据库文件路径")
-	port   = flag.Int("port", 1234, "WebUI 监听端口")
+	port   = flag.Int("port", 0, "WebUI 监听端口（0 = 使用数据库配置）")
 )
 
 func main() {
@@ -66,9 +66,9 @@ func main() {
 		log.Fatalf("初始化配置失败: %v", err)
 	}
 
-	// 若命令行指定了端口，覆盖配置
+	// 若命令行显式指定了端口（非 0），覆盖配置
 	g := cfgMgr.General()
-	if *port != 1234 {
+	if *port != 0 {
 		g.WebUIPort = *port
 		_ = cfgMgr.UpdateGeneral(g)
 	}
@@ -151,7 +151,9 @@ func registerRoutes(mux *http.ServeMux, h *webui.Handlers) {
 	mux.HandleFunc("/api/ips", h.HandleAPIIPs)
 	mux.HandleFunc("/api/ips/add", h.HandleAPIIPAdd)
 	mux.HandleFunc("/api/ips/remove", h.HandleAPIIPRemove)
+	mux.HandleFunc("/api/ips/priority", h.HandleAPIIPPriority)
 	mux.HandleFunc("/api/ips/import-probe", h.HandleAPIIPImportProbe)
+	mux.HandleFunc("/api/probe/stream", h.HandleAPIIPImportProbe)
 
 	// 扫描器
 	mux.HandleFunc("/api/scanner", h.HandleAPIScanner)

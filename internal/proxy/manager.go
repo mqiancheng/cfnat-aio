@@ -1,10 +1,13 @@
 // Package proxy CFNAT-AIO 代理转发模块
 //
 // 核心特性：
-//   - 继承 cfnat 的转发逻辑（SOCKS5 / HTTP）
+//   - 继承 cfnat 的粘性单 IP + 故障切换逻辑（cfnat-docker 方案）
 //   - 多地区管理：每个 ProxyRegion 一个独立监听端口
 //   - 动态增删地区（WebUI 改配置即可，不重启进程）
-//   - 兜底：库中 IP 全挂时自动切全量 CF 随机 IP
+//   - 收藏 IP：priority>0，按排位号顺序使用（#1最优先），挂了换下一个
+//   - 无收藏 IP 时：动态搜索 CF 全网 IP 作为代理目标
+//   - 后台 statusCheck 自检：连续失败触发 switchToNextValidIP
+//   - 兜底：收藏 IP 全挂时自动切全量 CF 随机 IP
 //   - 热重载：regions 变更后自动重启对应监听
 package proxy
 
@@ -12,15 +15,17 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/tls"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"log"
 	"net"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"cfnat-aio/internal/config"
@@ -28,31 +33,44 @@ import (
 	"cfnat-aio/internal/logging"
 )
 
-// 全量 CF IP 兜底池（每 /24 抽 1 个，懒加载）
+// 全量 CF IPv4 兜底池（与旧 cfnat 一致：完整 /24 列表，每个抽随机 IP）
+// 来源：https://www.baipiao.eu.org/cloudflare/ips-v4
 var fallbackCIDRs = []string{
-	"103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "104.16.0.0/13",
-	"104.24.0.0/14", "108.162.192.0/18", "131.0.72.0/22", "141.101.64.0/18",
-	"162.158.0.0/15", "172.64.0.0/13", "173.245.48.0/20", "188.114.96.0/20",
-	"190.93.240.0/20", "197.234.240.0/22", "198.41.128.0/17",
+	"103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
+	"104.16.0.0/13", "104.24.0.0/14",
+	"108.162.192.0/18",
+	"131.0.72.0/22",
+	"141.101.64.0/18",
+	"162.158.0.0/15",
+	"172.64.0.0/13",
+	"173.245.48.0/20",
+	"188.114.96.0/20",
+	"190.93.240.0/20",
+	"197.234.240.0/22",
+	"198.41.128.0/17",
 }
 
 // Manager 多地区代理管理器
 type Manager struct {
-	store   *config.SQLiteStore
-	lib     *iplibrary.Library
-	cfgMgr  *config.Manager
+	store  *config.SQLiteStore
+	lib    *iplibrary.Library
+	cfgMgr *config.Manager
 
-	mu      sync.Mutex
-	listeners map[string]*regionListener  // region -> listener
-	regions   map[string]config.ProxyRegion // region -> 最新配置
+	mu        sync.Mutex
+	listeners map[string]*regionListener // region -> listener
+	regions   map[string]config.ProxyRegion
 
-	fallbackPicks map[string][]string // region -> 当前兜底池（懒填充）
+	fallbackPicks map[string][]string // region -> 当前兜底热池（常驻扫描维护，已按 colo 筛选+延迟排序）
+
+	// 常驻扫描（cfnat-docker 同款 scanIPs 循环）：每个 enabled 地区一个后台 goroutine
+	scanMu           sync.Mutex                    // 保护 regionScanCancel（与 m.mu 分开，避免 Sync 死锁）
+	regionScanCancel map[string]context.CancelFunc // region -> 取消函数
+	scanInterval     time.Duration                 // 常驻扫描刷新间隔
 
 	// 运行状态（供 WebUI 显示）
 	running    bool
 	startedAt  time.Time
 	lastHealth map[string]time.Time // region -> 上次健康检查时间
-	currentIP  map[string]string    // region -> 当前代理中使用的 IP（从日志/手动）
 }
 
 // New 创建代理管理器
@@ -63,10 +81,11 @@ func New(store *config.SQLiteStore, lib *iplibrary.Library, cfgMgr *config.Manag
 		cfgMgr:        cfgMgr,
 		listeners:     make(map[string]*regionListener),
 		regions:       make(map[string]config.ProxyRegion),
-		fallbackPicks: make(map[string][]string),
-		lastHealth:    make(map[string]time.Time),
-		currentIP:     make(map[string]string),
-		startedAt:     time.Now(),
+		fallbackPicks:    make(map[string][]string),
+		regionScanCancel: make(map[string]context.CancelFunc),
+		scanInterval:     10 * time.Minute,
+		lastHealth:       make(map[string]time.Time),
+		startedAt:        time.Now(),
 	}
 	return m
 }
@@ -91,7 +110,7 @@ func (m *Manager) Sync() error {
 			l.stop()
 			delete(m.listeners, name)
 			delete(m.regions, name)
-			log.Printf("[proxy] region %s removed/stopped", name)
+			m.StopRegionScanner(name)
 		}
 	}
 
@@ -105,25 +124,183 @@ func (m *Manager) Sync() error {
 			continue
 		}
 		if exists {
-			// 配置变化（端口/colo），重启
 			cur.stop()
 			delete(m.listeners, name)
+			m.StopRegionScanner(name)
 		}
 		l := m.startRegion(r)
 		if l != nil {
 			m.listeners[name] = l
 			m.regions[name] = r
-			log.Printf("[proxy] region %s listening on :%d", name, r.Port)
+			logging.InfoTo("proxy", "region %s listening on :%d", name, r.Port)
+			// 启动该地区的常驻扫描（cfnat-docker 同款 scanIPs 循环），与代理独立运行
+			m.StartRegionScanner(r)
 		}
 	}
 	return nil
 }
 
+// regionListener 每个地区的代理监听器
+// 实现了 cfnat-docker 的粘性单 IP + 故障切换机制
 type regionListener struct {
 	region config.ProxyRegion
 	ln     net.Listener
 	cancel context.CancelFunc
 	done   chan struct{}
+
+	// usePinned 为热切换标志：WebUI 切换"使用收藏IP"时原地更新，
+	// 运行中的 pickTarget 立即读到，无需重启监听/扫描（由 RefreshRegionIPs 维护）
+	usePinned atomic.Bool
+
+	// === 粘性 IP 管理（cfnat-docker 方案）===
+	ipMgr *ipManager
+}
+
+// ipManager 粘性 IP 管理器（移植自 cfnat-docker/cfnat.go）
+//   - 持有一个 currentIP
+//   - 故障时切到 ipAddresses 列表中的下一个有效 IP
+//   - 全失败时标记 allChecked
+//   - 支持 currentIP 来自兜底池（fallbackMode）—— 同样粘性
+type ipManager struct {
+	mu            sync.RWMutex
+	currentIP     string
+	ipAddresses   []string // 收藏 IP 列表（无收藏时为空）
+	currentIndex  int
+	allIPsChecked bool
+	fallbackMode  bool // 当前 currentIP 来自兜底池
+	currentDelayMs int64 // 当前 IP 的延迟（毫秒），0 表示未测量/来自 IP 库
+}
+
+func (im *ipManager) setIPs(ips []string) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.ipAddresses = ips
+	im.currentIndex = 0
+	im.currentIP = ""
+	im.fallbackMode = false
+	im.allIPsChecked = false
+	im.currentDelayMs = 0
+}
+
+// refresh 刷新 IP 列表（保留 currentIP 如果它仍在列表中，否则清空）
+// 注意：不修改 fallbackMode，由调用方根据业务逻辑显式设置
+func (im *ipManager) refresh(ips []string) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.ipAddresses = ips
+	im.allIPsChecked = false
+	// 如果当前 currentIP 不在新列表里 → 清空（但不改变 fallbackMode）
+	found := false
+	for i, x := range ips {
+		if x == im.currentIP {
+			im.currentIndex = i
+			found = true
+			break
+		}
+	}
+	if !found {
+		im.currentIP = ""
+		im.currentIndex = 0
+		im.currentDelayMs = 0
+	}
+}
+
+// setFallbackIP 设置一个兜底池 IP 作为 currentIP（粘性使用）
+func (im *ipManager) setFallbackIP(ip string, delayMs int64) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.currentIP = ip
+	im.fallbackMode = true
+	im.currentDelayMs = delayMs
+	im.allIPsChecked = false
+}
+
+// markFallback 标记当前为兜底池模式（用于展示与失败处理区分）
+func (im *ipManager) markFallback() {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.fallbackMode = true
+}
+
+// isFallback 判断 currentIP 是否来自兜底池
+func (im *ipManager) isFallback() bool {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return im.fallbackMode && im.currentIP != ""
+}
+
+func (im *ipManager) getCurrentDelayMs() int64 {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return im.currentDelayMs
+}
+
+func (im *ipManager) updateDelayMs(ms int64) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.currentDelayMs = ms
+}
+
+func (im *ipManager) getCurrentIP() string {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	return im.currentIP
+}
+
+func (im *ipManager) setCurrentIP(ip string) {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.currentIP = ip
+	for i, x := range im.ipAddresses {
+		if x == ip {
+			im.currentIndex = i
+			break
+		}
+	}
+}
+
+func (im *ipManager) getIPs() []string {
+	im.mu.RLock()
+	defer im.mu.RUnlock()
+	out := make([]string, len(im.ipAddresses))
+	copy(out, im.ipAddresses)
+	return out
+}
+
+func (im *ipManager) clearCurrent() {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+	im.currentIP = ""
+	im.fallbackMode = false
+}
+
+// switchToNextValidIP 切换到下一个有效 IP（移植自 cfnat-docker）
+//   - 从当前位置往后找
+//   - 跳过当前 IP
+//   - 验证后切换
+//   - 都轮过了则标记 allChecked
+func (im *ipManager) switchToNextValidIP(checkFn func(ip string) bool) bool {
+	im.mu.Lock()
+	defer im.mu.Unlock()
+
+	for i := im.currentIndex + 1; i < len(im.ipAddresses); i++ {
+		ip := im.ipAddresses[i]
+		if ip == im.currentIP {
+			continue
+		}
+		if checkFn(ip) {
+			oldIP := im.currentIP
+			im.currentIP = ip
+			im.currentIndex = i
+			im.allIPsChecked = false
+			logging.InfoTo("proxy", "切换 IP: %s → %s (索引 %d)", oldIP, ip, i)
+			return true
+		}
+	}
+
+	im.allIPsChecked = true
+	logging.WarnTo("proxy", "所有 IP 都已轮过，触发兜底池")
+	return false
 }
 
 func (rl *regionListener) stop() {
@@ -143,23 +320,195 @@ func (m *Manager) startRegion(r config.ProxyRegion) *regionListener {
 		logging.ErrorTo("proxy", "✗ 监听 :%d 失败: %v", r.Port, err)
 		return nil
 	}
-	logging.InfoTo("proxy", "▶ 启动代理 %s → :%d (colo=%s, 当前可用 IP=%d)",
-		r.Name, r.Port, r.Code, m.lib.CountIPs(r.Name))
+	logging.InfoTo("proxy", "▶ 启动代理 %s → :%d (colo=%s, 当前可用 IP=%d, 首选 IP=%d)",
+		r.Name, r.Port, r.Code, m.lib.CountIPs(r.Name), m.lib.CountIPs(r.Name))
 	ctx, cancel := context.WithCancel(context.Background())
 	rl := &regionListener{
 		region: r,
 		ln:     ln,
 		cancel: cancel,
 		done:   make(chan struct{}),
+		ipMgr:  &ipManager{},
 	}
+	rl.usePinned.Store(r.UsePinned)
+
+	// 初始化 IP 池：优先首选 IP（priority<=2），关闭收藏时则用兜底池（cfnat-docker 同款 IP 列表）
+	ips := m.initRegionIPs(r)
+	rl.ipMgr.refresh(ips)
+	// 兜底模式（use_pinned=false 且池非空）→ 标记，使选 IP / 故障切换 / 展示与收藏 IP 走一致逻辑
+	if !r.UsePinned && len(ips) > 0 {
+		rl.ipMgr.markFallback()
+	}
+
+	// 选第一个有效 IP 作为 currentIP
+	m.selectInitialIP(rl)
+
 	go func() {
 		defer close(rl.done)
-		m.serveRegion(ctx, ln, r)
+		m.serveRegion(ctx, ln, r, rl)
 	}()
+
+	// 后台 statusCheck 协程（cfnat-docker 风格）
+	go m.statusCheckLoop(ctx, r, rl)
+
 	return rl
 }
 
-func (m *Manager) serveRegion(ctx context.Context, ln net.Listener, r config.ProxyRegion) {
+// resolveDomainIPs 解析域名得到 IPv4 列表（支持多 A 记录轮询）
+// 域名应关闭 Cloudflare 代理（灰色云朵），A 记录直接指向优选 IP
+func (m *Manager) resolveDomainIPs(domain string) []string {
+	host := domain
+	if i := strings.Index(host, "/"); i > 0 {
+		host = host[:i]
+	}
+	if host == "" {
+		return nil
+	}
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		logging.ErrorTo("proxy", "域名 %s 解析失败: %v", host, err)
+		return nil
+	}
+	var out []string
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			out = append(out, v4.String())
+		}
+	}
+	return out
+}
+
+// initRegionIPs 初始化地区 IP 池
+//   - 只使用收藏的 IP（priority<=2）作为代理候选，按优先级升序、速度降序排列
+//   - 无收藏 IP 时返回 nil（代理将直接走常驻扫描热池/兜底池）
+//   - 域名模式（UseDomainIP=true）：解析 Domain 得到多 IP（由测速脚本维护为优选低延迟 IP）
+func (m *Manager) initRegionIPs(r config.ProxyRegion) []string {
+	// 开关关闭时：不使用收藏 IP，使用 cfnat-docker 同款兜底池（即 IP 列表本身）
+	if !r.UsePinned {
+		// 兜底池由常驻扫描维护，已按 colo 过滤 + 延迟排序；直接作为 IP 列表加载，
+		// 与收藏 IP 走完全相同的 selectInitialIP / switchToNextValidIP 逻辑。
+		// 注意：本函数仅在 Sync() 持 m.mu 时调用，直接读 fallbackPicks 即可（避免重复加锁死锁）。
+		pool := m.fallbackPicks[r.Name]
+		if len(pool) > 0 {
+			logging.InfoTo("proxy", "地区 %s 已关闭收藏IP代理（use_pinned=false），使用兜底池 %d 个IP", r.Name, len(pool))
+			return pool
+		}
+		logging.InfoTo("proxy", "地区 %s 兜底池尚未就绪，首次连接时按需扫描", r.Name)
+		return nil
+	}
+	// 域名模式：解析 Domain 得到多 IP 作为转发目标池
+	if r.UseDomainIP && r.Domain != "" {
+		ips := m.resolveDomainIPs(r.Domain)
+		if len(ips) > 0 {
+			logging.InfoTo("proxy", "地区 %s 域名模式: %s 解析到 %d 个IP（DNS 已优选）", r.Name, r.Domain, len(ips))
+			return ips
+		}
+		logging.WarnTo("proxy", "地区 %s 域名 %s 解析为空，回退到收藏IP", r.Name, r.Domain)
+	}
+	// IP 库模式：只取收藏 IP（priority>0）
+	entries := m.lib.ListIPs(r.Name)
+	if len(entries) == 0 {
+		logging.InfoTo("proxy", "地区 %s 无IP库IP，将走兜底池", r.Name)
+		return nil
+	}
+	var pinned []config.IPEntry
+	for _, e := range entries {
+		if normPriority(e.Priority) > 0 {
+			pinned = append(pinned, e)
+		}
+	}
+	if len(pinned) == 0 {
+		logging.InfoTo("proxy", "地区 %s 有 %d 个IP但无收藏IP，将走兜底池", r.Name, len(entries))
+		return nil
+	}
+	// 收藏 IP 排序：排位号升序（1最前=最高优先）
+	sort.Slice(pinned, func(i, j int) bool {
+		return pinned[i].Priority < pinned[j].Priority
+	})
+	ips := make([]string, 0, len(pinned))
+	for _, e := range pinned {
+		ips = append(ips, e.IP)
+	}
+	logging.InfoTo("proxy", "地区 %s 使用 %d 个收藏IP作为代理候选（共 %d 个IP库IP）", r.Name, len(ips), len(entries))
+	return ips
+}
+
+// normPriority 将 0 视为未收藏
+func normPriority(p int) int {
+	if p <= 0 {
+		return 0
+	}
+	return p
+}
+
+// selectInitialIP 选第一个有效 IP
+func (m *Manager) selectInitialIP(rl *regionListener) {
+	ips := rl.ipMgr.getIPs()
+	if rl.region.UseDomainIP {
+		// 域名模式：DNS 里的 IP 已是测速脚本筛选的优选低延迟 IP，
+		// 直接选第一个（DNS 轮询本身提供多 IP 负载均衡），无需再做延迟筛选
+		if len(ips) > 0 {
+			rl.ipMgr.setCurrentIP(ips[0])
+			logging.InfoTo("proxy", "地区 %s 域名模式初始 currentIP = %s（共 %d 个候选，DNS 已优选）", rl.region.Name, ips[0], len(ips))
+		}
+		return
+	}
+	// IP 库模式：选第一个可达的
+	for _, ip := range ips {
+		if m.checkValidIP(ip, rl.region) {
+			rl.ipMgr.setCurrentIP(ip)
+			logging.InfoTo("proxy", "地区 %s 初始 currentIP = %s", rl.region.Name, ip)
+			return
+		}
+	}
+	if len(ips) > 0 {
+		rl.ipMgr.setCurrentIP(ips[0])
+		logging.WarnTo("proxy", "地区 %s 所有 IP 都验证失败，临时使用 %s", rl.region.Name, ips[0])
+		return
+	}
+	// 库 IP 为空（use_pinned=false 或无收藏 IP）→ 标记为兜底模式
+	// 不在此处阻塞式扫描兜底池（会拖慢启动），由 pickTarget 在首次连接时按需扫描
+	logging.InfoTo("proxy", "地区 %s 无库IP可用，将使用兜底池（首次连接时按需选取）", rl.region.Name)
+}
+
+// checkValidIP 验证 IP 是否可用（移植自 cfnat-docker）
+func (m *Manager) checkValidIP(ip string, r config.ProxyRegion) bool {
+	address := ip
+	if strings.Contains(ip, ":") {
+		address = fmt.Sprintf("[%s]", ip)
+	}
+	domain := r.Domain
+	if domain == "" {
+		domain = "cloudflaremirrors.com/debian"
+	}
+	targetURL := fmt.Sprintf("https://%s", domain)
+	if !r.TLS {
+		targetURL = fmt.Sprintf("http://%s", domain)
+	}
+	tr := &http.Transport{
+		TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			dialer := &net.Dialer{Timeout: 2 * time.Second}
+			tp := r.TargetPort
+			if tp <= 0 {
+				tp = 443
+			}
+			return dialer.DialContext(ctx, network, fmt.Sprintf("%s:%d", address, tp))
+		},
+	}
+	client := &http.Client{
+		Timeout:   3 * time.Second,
+		Transport: tr,
+	}
+	resp, err := client.Get(targetURL)
+	if err != nil {
+		return false
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode == r.ExpectCode
+}
+
+func (m *Manager) serveRegion(ctx context.Context, ln net.Listener, r config.ProxyRegion, rl *regionListener) {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
@@ -168,24 +517,22 @@ func (m *Manager) serveRegion(ctx context.Context, ln net.Listener, r config.Pro
 				return
 			default:
 			}
-			// 判断是否 listener 已关闭
 			if strings.Contains(err.Error(), "closed") {
 				return
 			}
-			// 临时错误，继续
 			time.Sleep(100 * time.Millisecond)
 			continue
 		}
-		go m.handleConn(ctx, conn, r)
+		go m.handleConn(ctx, conn, r, rl)
 	}
 }
 
-// handleConn 处理一个客户端连接（自动协议检测：SOCKS5 / HTTP CONNECT / TLS透传）
-func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.ProxyRegion) {
+// handleConn 处理一个客户端连接
+// 核心：使用 rl.ipMgr 的 currentIP，而不是每次随机
+func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.ProxyRegion, rl *regionListener) {
 	defer client.Close()
 
-	// 选 IP
-	target, isFallback, err := m.pickTarget(r.Name)
+	target, isFallback, err := m.pickTarget(rl, r)
 	if err != nil {
 		logging.WarnTo("proxy", "%s: 没有可用目标 IP: %v", r.Name, err)
 		return
@@ -194,25 +541,42 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	if isFallback {
 		src = "兜底池"
 	}
-	logging.InfoTo("proxy", "%s: %s → %s:443 (%s)", r.Name,
+	tp := r.TargetPort
+	if tp <= 0 {
+		tp = 443
+	}
+	logging.InfoTo("proxy", "%s: %s → %s:%d (%s)", r.Name,
 		client.RemoteAddr().String(),
-		target, src)
+		target, tp, src)
 
-	m.mu.Lock()
-	m.currentIP[r.Name] = target
-	m.mu.Unlock()
-
-	// 连接上游 CF IP:443
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
-	upstream, err := dialer.DialContext(ctx, "tcp", fmt.Sprintf("%s:443", target))
+	upstream, err := dialer.DialContext(ctx, "tcp", net.JoinHostPort(target, fmt.Sprintf("%d", tp)))
 	if err != nil {
-		logging.WarnTo("proxy", "%s: 连接 %s:443 失败: %v", r.Name, target, err)
+		logging.WarnTo("proxy", "%s: 连接 %s:%d 失败: %v", r.Name, target, tp, err)
 		_ = m.store.MarkIPChecked(target, r.Name, false, 0, 0)
+		if isFallback {
+			// 兜底 IP 挂了 → 切到池子里下一个（cfnat-docker 同款 switchToNextValidIP，遍历列表）
+			ok := rl.ipMgr.switchToNextValidIP(func(ip string) bool {
+				return m.checkValidIP(ip, rl.region)
+			})
+			if ok {
+				logging.WarnTo("proxy", "%s: 兜底 IP %s 失效，切换到 %s", r.Name, target, rl.ipMgr.getCurrentIP())
+			} else {
+				// 全部轮过 → 重新扫描兜底池（cfnat-docker 的 rescan 行为），重置到最优
+				logging.WarnTo("proxy", "%s: 兜底池所有 IP 已轮过，触发重新扫描", r.Name)
+				go m.scanRegionFallback(context.Background(), r)
+			}
+		} else {
+			// 收藏 IP 挂了 → 切到列表里的下一个
+			rl.ipMgr.switchToNextValidIP(func(ip string) bool {
+				return m.checkValidIP(ip, rl.region)
+			})
+		}
 		return
 	}
 	defer upstream.Close()
 
-	// 协议自动检测：读第一个字节判断
+	// 协议自动检测
 	firstByte := make([]byte, 1)
 	client.SetReadDeadline(time.Now().Add(8 * time.Second))
 	if _, err := io.ReadFull(client, firstByte); err != nil {
@@ -221,25 +585,18 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 
 	switch {
 	case firstByte[0] == 0x05:
-		// SOCKS5 CONNECT 代理
 		if err := m.proxySOCKS5WithByte(client, upstream, firstByte); err != nil {
-			// SOCKS5 握手失败，回退到透传（重发已读字节）
 			upstream.Write(firstByte)
 			go io.Copy(upstream, client)
 			io.Copy(client, upstream)
 		}
-
 	case firstByte[0] >= 0x20 && firstByte[0] <= 0x7E:
-		// 可打印 ASCII → 可能是 HTTP CONNECT
 		if err := m.proxyHTTPConnect(client, upstream, firstByte); err != nil {
-			// HTTP 解析失败，回退到透传
 			upstream.Write(firstByte)
 			go io.Copy(upstream, client)
 			io.Copy(client, upstream)
 		}
-
 	default:
-		// 非标准开头的字节流（TLS ClientHello 等）→ 透传
 		upstream.Write(firstByte)
 		client.SetReadDeadline(time.Time{})
 		go io.Copy(upstream, client)
@@ -247,47 +604,346 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	}
 }
 
-// pickTarget 选取转发目标
-func (m *Manager) pickTarget(region string) (string, bool, error) {
-	ip, err := m.lib.PickRandom(region)
-	if err == nil {
-		return ip, false, nil
+// pickTarget 选取转发目标（cfnat-docker 风格：优先用 currentIP）
+// 1. 收藏 IP 有 → 用收藏 IP（currentIP 已记录）
+// 2. 收藏 IP 空 / 全挂 → 从常驻扫描维护的热兜底池取（已按 colo 筛选 + 延迟排序，零等待）
+func (m *Manager) pickTarget(rl *regionListener, r config.ProxyRegion) (string, bool, error) {
+	// 有 currentIP 就复用（不管来自收藏 IP 还是兜底池）
+	if cur := rl.ipMgr.getCurrentIP(); cur != "" {
+		return cur, rl.ipMgr.isFallback(), nil
 	}
-	// 兜底
-	candidates := m.getFallbackCandidates(region)
-	if len(candidates) == 0 {
-		return "", false, fmt.Errorf("no candidates for region %s", region)
+	// 当前无 IP（首连 / 上一轮耗尽）→ 从 ipMgr 列表选第一个有效（收藏或兜底池，逻辑完全一致）
+	ips := rl.ipMgr.getIPs()
+	if len(ips) == 0 {
+		// 兜底池尚未就绪（后台扫描器可能还在首次扫描中）。
+		// 不在此处同步阻塞重扫——由 regionScanLoop 异步维护热池，
+		// 避免每个连接请求都触发一次全量探测导致雪崩。
+		m.mu.Lock()
+		pool := m.fallbackPicks[r.Name]
+		m.mu.Unlock()
+		if len(pool) == 0 {
+			return "", false, fmt.Errorf("no candidates for region %s (fallback pool not ready)", r.Name)
+		}
+		rl.ipMgr.refresh(pool)
+		rl.ipMgr.markFallback()
+		ips = pool
 	}
-	ip, _ = m.lib.PickFallback(candidates)
-	return ip, true, nil
+	// 选第一个可达的（与 selectInitialIP 一致）。usePinned 读原子标志，热切换即时生效。
+	usePinned := rl.usePinned.Load()
+	for _, ip := range ips {
+		if m.checkValidIP(ip, rl.region) {
+			rl.ipMgr.setCurrentIP(ip)
+			if !usePinned {
+				rl.ipMgr.markFallback()
+			}
+			return ip, !usePinned, nil
+		}
+	}
+	if len(ips) > 0 {
+		rl.ipMgr.setCurrentIP(ips[0])
+		if !usePinned {
+			rl.ipMgr.markFallback()
+		}
+		logging.WarnTo("proxy", "%s: 兜底池所有 IP 验证失败，临时使用 %s", r.Name, ips[0])
+		return ips[0], !usePinned, nil
+	}
+	return "", false, fmt.Errorf("no valid IP for region %s", r.Name)
 }
 
-// getFallbackCandidates 懒加载兜底池
-func (m *Manager) getFallbackCandidates(region string) []string {
+// pickBestLatencyIP 从候选 IP 中按 colo + 延迟筛选最优（与旧 cfnat 一致）
+//   - r.Code 非空时：只保留数据中心匹配的 IP（通过 CF-RAY 头识别）
+//   - 优先选低于 Delay 阈值的，无匹配则选 colo 匹配里延迟最低的
+//   - 完全无 colo 匹配时回退到全局最低延迟（避免选不到 IP）
+// 返回 (选中IP, 延迟毫秒)
+func (m *Manager) pickBestLatencyIP(candidates []string, r config.ProxyRegion) (string, int64) {
+	if len(candidates) <= 1 {
+		ip, _ := m.lib.PickFallback(candidates)
+		return ip, 0
+	}
+	// 限制参与探测的候选数，避免首次选择阻塞过久
+	const maxProbe = 3000
+	probes := candidates
+	if len(probes) > maxProbe {
+		probes = probes[:maxProbe]
+	}
+	threshold := time.Duration(r.Delay) * time.Millisecond
+
+	sem := make(chan struct{}, 400)
+	type probe struct {
+		ip   string
+		lat  time.Duration
+		colo string
+	}
+	ch := make(chan probe, len(probes))
+	for _, ip := range probes {
+		sem <- struct{}{}
+		go func(addr string) {
+			defer func() { <-sem }()
+			colo, lat := m.detectColo(addr)
+			ch <- probe{addr, lat, colo}
+		}(ip)
+	}
+
+	var matchedAll []probe    // colo 匹配（r.Code 为空则全部算匹配）
+	var matchedThresh []probe // colo 匹配且延迟达标
+	lowest := probe{lat: -1}  // 全局最低延迟（回退用），-1 表示尚未有有效值
+	for range probes {
+		p := <-ch
+		if p.lat < 0 {
+			continue
+		}
+		coloOK := r.Code == "" || strings.EqualFold(p.colo, r.Code)
+		if coloOK {
+			matchedAll = append(matchedAll, p)
+			if threshold <= 0 || p.lat <= threshold {
+				matchedThresh = append(matchedThresh, p)
+			}
+		}
+		if lowest.lat < 0 || p.lat < lowest.lat {
+			lowest = p
+		}
+	}
+
+	// 优先阈值内匹配，其次 colo 匹配，最后全局最低
+	pool := matchedThresh
+	if len(pool) == 0 {
+		pool = matchedAll
+	}
+	if len(pool) > 0 {
+		best := pool[0]
+		for _, p := range pool {
+			if p.lat < best.lat {
+				best = p
+			}
+		}
+		if len(matchedThresh) > 0 {
+			logging.InfoTo("proxy", "%s: 兜底池优选 IP = %s（colo=%s, 延迟 %dms ≤ 阈值 %dms，匹配 %d 个）",
+				r.Name, best.ip, best.colo, best.lat.Milliseconds(), r.Delay, len(matchedAll))
+		} else {
+			logging.WarnTo("proxy", "%s: 无 %s 的 IP 低于 %dms（colo=%s 最低 %dms），使用 colo 匹配最低",
+				r.Name, r.Code, r.Delay, best.colo, best.lat.Milliseconds())
+		}
+		return best.ip, best.lat.Milliseconds()
+	}
+	if lowest.lat >= 0 {
+		logging.WarnTo("proxy", "%s: 无 %s colo 的 IP（最低 %dms 来自 %s），回退全局最低延迟 IP",
+			r.Name, r.Code, lowest.lat.Milliseconds(), lowest.colo)
+		return lowest.ip, lowest.lat.Milliseconds()
+	}
+	ip, _ := m.lib.PickFallback(candidates)
+	return ip, 0
+}
+
+// detectColo 通过 TCP 连接到 :80 读取 CF-RAY 头识别数据中心代码
+// 延迟仅测量 TCP 握手时间（与旧 cfnat scanIPs 第764-771行一致），不含 HTTP 往返
+// CF-RAY 格式为 "<id>-<colo_code>"
+func (m *Manager) detectColo(ip string) (string, time.Duration) {
+	dialer := &net.Dialer{Timeout: 3 * time.Second}
+	t0 := time.Now()
+	conn, err := dialer.Dial("tcp", net.JoinHostPort(ip, "80"))
+	if err != nil {
+		return "", -1
+	}
+	tcpLat := time.Since(t0) // 纯 TCP 握手时间（与 cfnat-docker 一致）
+
+	// 再发 HTTP 请求拿 CF-RAY（复用已有连接，不计入延迟）
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	req, _ := http.NewRequest("GET", "/", nil)
+	req.Header.Set("User-Agent", "Mozilla/5.0")
+	req.Close = true
+	if err := req.Write(conn); err != nil {
+		conn.Close()
+		return "", tcpLat
+	}
+	resp, err := http.ReadResponse(bufio.NewReader(conn), req)
+	if err != nil {
+		conn.Close()
+		return "", tcpLat
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, resp.Body) // drain body
+
+	cfRay := resp.Header.Get("CF-RAY")
+	if cfRay == "" {
+		return "", tcpLat
+	}
+	parts := strings.Split(cfRay, "-")
+	return parts[len(parts)-1], tcpLat
+}
+
+// statusCheckLoop 后台健康检查循环（移植自 cfnat-docker）
+// 定时连接自己的 127.0.0.1:port 验证端口可用
+// 失败则触发 switchToNextValidIP 切换 IP
+// 每隔几个周期还会对当前 IP 做 detectColo 刷新延迟值（用于仪表盘展示）
+func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl *regionListener) {
+	_, localPort, _ := net.SplitHostPort(fmt.Sprintf(":%d", r.Port))
+	checkAddr := fmt.Sprintf("127.0.0.1:%s", localPort)
+
+	// 给一个初始延迟
+	select {
+	case <-ctx.Done():
+		return
+	case <-time.After(10 * time.Second):
+	}
+
+	ticker := time.NewTicker(8 * time.Second)
+	defer ticker.Stop()
+
+	delayCheckTick := 0 // 计数器：每 4 次健康检查（约 32s）测一次延迟
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			if !m.doStatusCheck(checkAddr, r) {
+				if rl.ipMgr.isFallback() {
+					// 兜底 IP 失效 → 清空 currentIP，下次连接重新选
+					rl.ipMgr.clearCurrent()
+					logging.WarnTo("proxy", "%s: 兜底 IP 失效，下次重选", r.Name)
+				} else if !rl.ipMgr.switchToNextValidIP(func(ip string) bool {
+					return m.checkValidIP(ip, r)
+				}) {
+					// 收藏 IP 全部轮过 → 清空 currentIP 让 pickTarget 走兜底
+					rl.ipMgr.clearCurrent()
+					logging.WarnTo("proxy", "%s 所有收藏 IP 都已耗尽，将走兜底池", r.Name)
+				}
+			}
+			m.mu.Lock()
+			m.lastHealth[r.Name] = time.Now()
+			m.mu.Unlock()
+
+			// 周期性刷新当前 IP 的延迟（每 ~32 秒一次）
+			delayCheckTick++
+			if delayCheckTick >= 4 {
+				delayCheckTick = 0
+				m.refreshCurrentDelay(rl, r)
+			}
+		}
+	}
+}
+
+// doStatusCheck 单次自检：连接 127.0.0.1:port 看端口是否还通
+func (m *Manager) doStatusCheck(checkAddr string, r config.ProxyRegion) bool {
+	conn, err := net.DialTimeout("tcp", checkAddr, 2*time.Second)
+	if err != nil {
+		logging.WarnTo("proxy", "%s statusCheck 失败: %v", r.Name, err)
+		return false
+	}
+	conn.Close()
+	return true
+}
+
+// refreshCurrentDelay 对当前 IP 做 detectColo 刷新延迟（用于仪表盘展示）
+// 非阻塞：在后台跑，成功就更新 ipMgr 的 currentDelayMs
+func (m *Manager) refreshCurrentDelay(rl *regionListener, r config.ProxyRegion) {
+	cur := rl.ipMgr.getCurrentIP()
+	if cur == "" {
+		return
+	}
+	go func() {
+		_, lat := m.detectColo(cur)
+		if lat > 0 {
+			rl.ipMgr.updateDelayMs(lat.Milliseconds())
+			logging.DebugTo("proxy", "%s: 延迟刷新 %s = %dms", r.Name, cur, lat.Milliseconds())
+		}
+	}()
+}
+
+// getFallbackCandidates 懒加载兜底池（与旧 cfnat 一致：全量 CF IP 范围）
+// 每个 /24 生成 samplesPer24 个随机 IP，保证足够大的候选池来找到低延迟 IP
+func (m *Manager) getFallbackCandidates(r config.ProxyRegion) []string {
+	// 域名模式：兜底也用域名解析（可能拿到更新的 IP）
+	if r.UseDomainIP && r.Domain != "" {
+		return m.resolveDomainIPs(r.Domain)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if cached, ok := m.fallbackPicks[region]; ok && len(cached) > 0 {
+	if cached, ok := m.fallbackPicks[r.Name]; ok && len(cached) > 0 {
 		return cached
 	}
-	// 从 CIDR 池抽取一些 IP
-	var out []string
+
+	samplesPer24 := 1 // 每个 /24 抽 1 个随机 IP（与旧 cfnat 一致）
+	out := make(map[string]struct{}) // 去重
+
 	for _, c := range fallbackCIDRs {
 		_, ipnet, err := net.ParseCIDR(c)
 		if err != nil {
 			continue
 		}
-		// 每个 /24 抽一个
-		offset := uint32(time.Now().UnixNano()%256) + 1
-		ip := addOffset(ipnet.IP.To4(), offset)
-		if ip != nil {
-			out = append(out, ip.String())
+		// 把大段拆成 /24 子网
+		subnets := expandToSlash24(ipnet)
+		for _, sub := range subnets {
+			for i := 0; i < samplesPer24; i++ {
+				offset := uint32(time.Now().UnixNano()+int64(i*1000))%254 + 1
+				ip := addOffset(sub.IP.To4(), offset)
+				if ip != nil {
+					out[ip.String()] = struct{}{}
+				}
+			}
 		}
 	}
-	if len(out) > 50 {
-		out = out[:50]
+
+	result := make([]string, 0, len(out))
+	for ip := range out {
+		result = append(result, ip)
 	}
-	m.fallbackPicks[region] = out
-	return out
+	// 打乱顺序避免总是测同一批
+	shuffleStrings(result)
+
+	m.fallbackPicks[r.Name] = result
+	logging.InfoTo("proxy", "兜底池生成 %d 个候选 IP（%d 个 /24 × 每个抽 %d）",
+		len(result), countSlash24(fallbackCIDRs), samplesPer24)
+	return result
+}
+
+// expandToSlash24 将任意 CIDR 拆分为 /24 子网列表
+func expandToSlash24(ipnet *net.IPNet) []*net.IPNet {
+	var result []*net.IPNet
+	ip4 := ipnet.IP.To4()
+	if ip4 == nil {
+		return result
+	}
+	maskSize, _ := ipnet.Mask.Size()
+	if maskSize >= 24 {
+		// 已经是 /24 或更小，直接返回
+		result = append(result, ipnet)
+		return result
+	}
+
+	start := binary.BigEndian.Uint32(ip4)
+	end := start | ^binary.BigEndian.Uint32(ipnet.Mask)
+
+	// 遍历每个 /24 的起始地址
+	for addr := start & 0xFFFFFF00; addr <= end; addr += 256 {
+		ip := make(net.IP, 4)
+		binary.BigEndian.PutUint32(ip, addr)
+		_, n, _ := net.ParseCIDR(fmt.Sprintf("%s/24", ip.String()))
+		result = append(result, n)
+	}
+	return result
+}
+
+// countSlash24 统计所有 CIDR 包含多少个 /24
+func countSlash24(cidrs []string) int {
+	total := 0
+	for _, c := range cidrs {
+		_, ipnet, err := net.ParseCIDR(c)
+		if err != nil {
+			continue
+		}
+		ip4 := ipnet.IP.To4()
+		if ip4 == nil {
+			continue
+		}
+		maskSize, _ := ipnet.Mask.Size()
+		if maskSize < 24 {
+			total += 1 << (24 - maskSize)
+		} else if maskSize == 24 {
+			total++
+		}
+	}
+	return total
 }
 
 func addOffset(base net.IP, offset uint32) net.IP {
@@ -300,12 +956,18 @@ func addOffset(base net.IP, offset uint32) net.IP {
 	return ip
 }
 
+// shuffleStrings Fisher-Yates 打乱字符串切片
+func shuffleStrings(s []string) {
+	for i := len(s) - 1; i > 0; i-- {
+		j := int(time.Now().UnixNano()) % (i + 1)
+		s[i], s[j] = s[j], s[i]
+	}
+}
+
 // proxySOCKS5WithByte 处理 SOCKS5 握手（首字节已读取）
 func (m *Manager) proxySOCKS5WithByte(client, upstream net.Conn, firstByte []byte) error {
 	_ = client.SetReadDeadline(time.Now().Add(10 * time.Second))
 
-	// ver 已确认是 0x05（firstByte[0]）
-	// 读 nmethods
 	nmethodsBuf := make([]byte, 1)
 	if _, err := io.ReadFull(client, nmethodsBuf); err != nil {
 		return err
@@ -315,12 +977,10 @@ func (m *Manager) proxySOCKS5WithByte(client, upstream net.Conn, firstByte []byt
 	if _, err := io.ReadFull(client, methods); err != nil {
 		return err
 	}
-	// 回应：无需认证
 	if _, err := client.Write([]byte{0x05, 0x00}); err != nil {
 		return err
 	}
 
-	// 读请求
 	buf := make([]byte, 4)
 	if _, err := io.ReadFull(client, buf); err != nil {
 		return err
@@ -335,13 +995,11 @@ func (m *Manager) proxySOCKS5WithByte(client, upstream net.Conn, firstByte []byt
 	}
 	logging.DebugTo("proxy", "SOCKS5 请求: %s", addr)
 
-	// 应答成功
 	if _, err := client.Write([]byte{0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0}); err != nil {
 		return err
 	}
 	_ = client.SetReadDeadline(time.Time{})
 
-	// 双向转发
 	go io.Copy(upstream, client)
 	io.Copy(client, upstream)
 	return nil
@@ -351,10 +1009,7 @@ func (m *Manager) proxySOCKS5WithByte(client, upstream net.Conn, firstByte []byt
 func (m *Manager) proxyHTTPConnect(client, upstream net.Conn, firstByte []byte) error {
 	client.SetReadDeadline(time.Now().Add(8 * time.Second))
 
-	// 用 bufio.Reader 包装（首字节 + 客户端流）
 	br := bufio.NewReader(io.MultiReader(bytes.NewReader(firstByte), client))
-
-	// 读 HTTP 请求
 	req, err := http.ReadRequest(br)
 	if err != nil {
 		return fmt.Errorf("HTTP parse: %w", err)
@@ -367,20 +1022,17 @@ func (m *Manager) proxyHTTPConnect(client, upstream net.Conn, firstByte []byte) 
 
 	logging.DebugTo("proxy", "HTTP CONNECT: %s", req.Host)
 
-	// 回应 200 Connection Established
 	if _, err := client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n")); err != nil {
 		return err
 	}
 	client.SetReadDeadline(time.Time{})
 
-	// br 可能已缓冲了 CONNECT 之后的隧道数据，先排空
 	if br.Buffered() > 0 {
 		buffered := make([]byte, br.Buffered())
 		io.ReadFull(br, buffered)
 		upstream.Write(buffered)
 	}
 
-	// 双向转发
 	go io.Copy(upstream, client)
 	io.Copy(client, upstream)
 	return nil
@@ -392,7 +1044,7 @@ func readSOCKSAddr(r io.Reader) (string, error) {
 		return "", err
 	}
 	switch atyp[0] {
-	case 0x01: // IPv4
+	case 0x01:
 		b := make([]byte, 4)
 		if _, err := io.ReadFull(r, b); err != nil {
 			return "", err
@@ -403,7 +1055,7 @@ func readSOCKSAddr(r io.Reader) (string, error) {
 		}
 		return fmt.Sprintf("%d.%d.%d.%d:%d", b[0], b[1], b[2], b[3],
 			int(portBuf[0])<<8|int(portBuf[1])), nil
-	case 0x03: // Domain
+	case 0x03:
 		l := make([]byte, 1)
 		if _, err := io.ReadFull(r, l); err != nil {
 			return "", err
@@ -417,7 +1069,7 @@ func readSOCKSAddr(r io.Reader) (string, error) {
 			return "", err
 		}
 		return fmt.Sprintf("%s:%d", string(domain), int(portBuf[0])<<8|int(portBuf[1])), nil
-	case 0x04: // IPv6
+	case 0x04:
 		b := make([]byte, 16)
 		if _, err := io.ReadFull(r, b); err != nil {
 			return "", err
@@ -431,61 +1083,85 @@ func readSOCKSAddr(r io.Reader) (string, error) {
 	return "", errors.New("未知ATYP")
 }
 
-// HandleHTTPProxy HTTP CONNECT 代理（备用）
-func (m *Manager) HandleHTTPProxy(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodConnect {
-		http.Error(w, "请使用CONNECT", http.StatusMethodNotAllowed)
-		return
+// liveRegion 读取实时地区配置（不持 m.mu，避免与 Sync 加锁顺序相反导致死锁）
+func (m *Manager) liveRegion(name string) *config.ProxyRegion {
+	regions := m.cfgMgr.Regions()
+	for i := range regions {
+		if regions[i].Name == name {
+			r := regions[i]
+			return &r
+		}
 	}
-	hijacker, ok := w.(http.Hijacker)
-	if !ok {
-		http.Error(w, "hijack not supported", http.StatusInternalServerError)
-		return
-	}
-	client, _, err := hijacker.Hijack()
-	if err != nil {
-		return
-	}
-	defer client.Close()
+	return nil
+}
 
-	region := r.Header.Get("X-CFNAT-Region")
-	if region == "" {
-		region = "HKG"
-	}
-	target, _, err := m.pickTarget(region)
-	if err != nil {
-		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+// RefreshRegionIPs 热刷新指定地区的 IP 池（WebUI 切换"使用收藏IP" / 改了优先级后调用）
+// 关键：原地刷新，不重启监听端口、不重启扫描器（cfnat-docker 无此概念，AIO 需要热切换）。
+//   - 读取最新配置（UsePinned 等），写入 listener 的原子标志
+//   - 重新加载 IP 池（收藏IP 或 热兜底池）
+//   - 若当前 currentIP 已不在新列表 / 不再是首选，重新选择
+func (m *Manager) RefreshRegionIPs(region string) {
+	m.mu.Lock()
+	rl, ok := m.listeners[region]
+	m.mu.Unlock()
+	if !ok || rl == nil {
 		return
 	}
-	upstream, err := net.DialTimeout("tcp", fmt.Sprintf("%s:443", target), 5*time.Second)
-	if err != nil {
-		client.Write([]byte("HTTP/1.1 502 Bad Gateway\r\n\r\n"))
+	live := m.liveRegion(region)
+	if live == nil {
 		return
 	}
-	defer upstream.Close()
-	client.Write([]byte("HTTP/1.1 200 Connection Established\r\n\r\n"))
+	r := *live
+	// 把最新 UsePinned 写入原子标志，使运行中的 pickTarget 立即读到（无需重启）
+	rl.usePinned.Store(r.UsePinned)
 
-	go io.Copy(upstream, client)
-	io.Copy(client, upstream)
+	oldIP := rl.ipMgr.getCurrentIP()
+	ips := m.initRegionIPs(r)
+	rl.ipMgr.refresh(ips)
+
+	// 兜底模式下 refresh 不改变 fallbackMode，此处显式恢复标记
+	if !r.UsePinned && len(ips) > 0 {
+		rl.ipMgr.markFallback()
+	}
+
+	// refresh 后两种情况需要重新选 currentIP：
+	//  1) currentIP 为空（旧 IP 已不在新列表里）
+	//  2) currentIP 还在新列表里，但它不是"最优先"的（P1 排第一）
+	needReselect := false
+	if rl.ipMgr.getCurrentIP() == "" {
+		needReselect = true
+	} else if len(ips) > 0 && ips[0] != rl.ipMgr.getCurrentIP() {
+		// 新排序后第一的 IP 不是 currentIP → 重新选（用最优先的）
+		needReselect = true
+		logging.InfoTo("proxy", "%s: IP 顺序有变，触发重新选择 (旧=%s, 新首选=%s)",
+			region, oldIP, ips[0])
+	}
+	if needReselect {
+		m.selectInitialIP(rl)
+	}
 }
 
 // Status 健康状态
 type Status struct {
-	Regions      []RegionStatus `json:"regions"`
-	StartedAt    string         `json:"started_at"`
-	UptimeSeconds int64         `json:"uptime_seconds"`
+	Regions       []RegionStatus `json:"regions"`
+	StartedAt     string         `json:"started_at"`
+	UptimeSeconds int64          `json:"uptime_seconds"`
 }
 
 // RegionStatus 地区状态
 type RegionStatus struct {
-	Name      string `json:"name"`
-	Port      int    `json:"port"`
-	Enabled   bool   `json:"enabled"`
-	IPCount   int    `json:"ip_count"`
-	Listening bool   `json:"listening"`
-	CurrentIP string `json:"current_ip"`
-	Colo      string `json:"colo"`
-	Clients   int    `json:"clients"` // 当前活跃连接数（近似）
+	Name            string `json:"name"`
+	Port            int    `json:"port"`
+	Enabled         bool   `json:"enabled"`
+	IPCount         int    `json:"ip_count"`
+	PinnedCount     int    `json:"pinned_count"`
+	Listening       bool   `json:"listening"`
+	CurrentIP       string `json:"current_ip"`
+	CurrentPriority int    `json:"current_priority"`
+	Colo            string `json:"colo"`
+	LastHealthCheck string `json:"last_health_check"`
+	CurrentDelayMs  int64  `json:"current_delay_ms"` // 当前 IP 延迟（毫秒），0=未测量/IP库
+	IsFallback      bool   `json:"is_fallback"`     // 当前 IP 是否来自兜底池
 }
 
 // Status 获取所有地区状态
@@ -495,15 +1171,32 @@ func (m *Manager) Status() Status {
 	regions := m.cfgMgr.Regions()
 	out := make([]RegionStatus, 0, len(regions))
 	for _, r := range regions {
-		_, listening := m.listeners[r.Name]
+		rl, listening := m.listeners[r.Name]
+		var currentIP string
+		var currentDelayMs int64
+		var isFallback bool
+		if listening && rl != nil {
+			currentIP = rl.ipMgr.getCurrentIP()
+			currentDelayMs = rl.ipMgr.getCurrentDelayMs()
+			isFallback = rl.ipMgr.isFallback()
+		}
+		var lastCheck string
+		if t, ok := m.lastHealth[r.Name]; ok {
+			lastCheck = t.UTC().Format("2006-01-02T15:04:05Z")
+		}
 		out = append(out, RegionStatus{
-			Name:      r.Name,
-			Port:      r.Port,
-			Enabled:   r.Enabled,
-			IPCount:   m.lib.CountIPs(r.Name),
-			Listening: listening,
-			CurrentIP: m.currentIP[r.Name],
-			Colo:      r.Code,
+			Name:            r.Name,
+			Port:            r.Port,
+			Enabled:         r.Enabled,
+			IPCount:         m.lib.CountIPs(r.Name),
+			PinnedCount:     m.lib.CountPinned(r.Name),
+			Listening:       listening,
+			CurrentIP:       currentIP,
+			CurrentPriority: 0,
+			Colo:            r.Code,
+			LastHealthCheck: lastCheck,
+			CurrentDelayMs:  currentDelayMs,
+			IsFallback:      isFallback,
 		})
 	}
 	uptime := int64(0)
@@ -516,5 +1209,3 @@ func (m *Manager) Status() Status {
 		UptimeSeconds: uptime,
 	}
 }
-
-// 静默导入占位（无）

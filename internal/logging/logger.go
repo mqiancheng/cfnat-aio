@@ -30,7 +30,7 @@ const (
 type Entry struct {
 	Time    time.Time `json:"time"`
 	Level   Level     `json:"level"`
-	Source  string    `json:"source"`  // proxy / scanner / fofa / system / webui
+	Source  string    `json:"source"`  // proxy / scanner / system / webui
 	Message string    `json:"message"`
 }
 
