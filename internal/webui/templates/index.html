@@ -112,6 +112,7 @@ body{
 /* ====== Form ====== */
 .form-row{display:flex;align-items:center;gap:10px;padding:6px 0;flex-wrap:wrap}
 .lbl{color:var(--ink-soft);font-size:12px;min-width:90px}
+.qm{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;margin-left:3px;border-radius:50%;background:var(--brand,#3b82f6);color:#fff;font-size:10px;font-weight:700;cursor:help;vertical-align:middle}
 .hint{font-size:10.5px;color:var(--ink-mute)}
 .req::after{content:" *";color:var(--err)}
 input,select,textarea{
@@ -704,6 +705,7 @@ async function loadProxies(){
         target_port: p.target_port || 443,
         task: p.task || 100,
         fallback: p.fallback !== false,
+        random: p.random !== false,
         colo: p.code || p.name
       };
       // 把 colo 同步回 proxies 数组（保证渲染时 p.code 有值）
@@ -746,6 +748,7 @@ function renderProxies(){
           <div class="gi"><span class="lbl">转发数</span><input type="number" value="${d.num||5}" oninput="setDraft('${esc(p.name)}','num',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">期望码</span><input type="number" value="${d.expect_code||200}" oninput="setDraft('${esc(p.name)}','expect_code',this.value)" class="w80"></div>
           <div class="gi"><span class="lbl">并发</span><input type="number" value="${d.task||100}" oninput="setDraft('${esc(p.name)}','task',this.value)" class="w80"></div>
+          <div class="gi"><span class="lbl">随机IP <span class="qm" title="对应 cfnat-docker 的 random 参数：开=每个 /24 网段随机抽 1 个 IP（抽样扫描，省流量，默认）；关=穷举 CIDR 内每一个 IP（全量扫描，候选量极大、极耗资源，慎用）。">?</span></span><label class="tog"><input type="checkbox" ${d.random?'checked':''} onchange="setDraft('${esc(p.name)}','random',this.checked)"><span class="tog-sl"></span></label></div>
         </div>
       </div>
     </div>`;
@@ -811,6 +814,7 @@ async function saveAllProxies(){
       use_domain_ip: d.use_domain_ip === true,
       ips: d.ips || p.ips,
       task: d.task !== undefined ? parseInt(d.task) : p.task,
+      random: d.random === true,
       fallback: d.fallback
     });
   });

@@ -39,6 +39,9 @@ type ProxyRegion struct {
 	UseDomainIP bool `json:"use_domain_ip"`  // 域名模式：解析 Domain 得到的多 IP 作为转发目标（DNS 需由测速脚本维护为优选 IP）
 	IPsType   string `json:"ips"`            // "4" 或 "6"
 	Task      int    `json:"task"`           // 并发数（扫描探测并发度）
+	Random    bool   `json:"random"`         // 是否随机生成候选IP（对应 cfnat-docker 的 random=）：
+	                                         //   true = 每个 /24 网段随机抽 1 个 IP（抽样扫描，省流量）
+	                                         //   false = 穷举 CIDR 内每一个 IP（全量扫描，极重）
 }
 
 // UnmarshalJSON 兼容新旧两种存储格式：
@@ -49,7 +52,8 @@ type ProxyRegion struct {
 func (r *ProxyRegion) UnmarshalJSON(data []byte) error {
 	type Alias ProxyRegion
 	tmp := struct {
-		Code json.RawMessage `json:"code"`
+		Code   json.RawMessage `json:"code"`
+		Random json.RawMessage `json:"random"`
 		*Alias
 	}{Alias: (*Alias)(r)}
 
@@ -68,6 +72,18 @@ func (r *ProxyRegion) UnmarshalJSON(data []byte) error {
 	}
 	if r.ExpectCode == 0 {
 		r.ExpectCode = 200
+	}
+	// random 默认 true（与 cfnat-docker 默认值一致）：仅当显式 false 时才穷举扫描。
+	// 旧数据若无 random 字段，统一视作 true，避免存量配置在升级后突变成全量穷举扫描。
+	if len(tmp.Random) == 0 || string(tmp.Random) == "null" {
+		r.Random = true
+	} else {
+		var b bool
+		if err := json.Unmarshal(tmp.Random, &b); err == nil {
+			r.Random = b
+		} else {
+			r.Random = true
+		}
 	}
 	return nil
 }
@@ -187,13 +203,13 @@ func (m *Manager) loadAll() error {
 		m.regions = []ProxyRegion{
 			{Name: "HKG", Code: "HKG", Port: 1001, Enabled: true, Fallback: true, TargetPort: 443,
 				TLS: true, IPNum: 20, Num: 5, ExpectCode: 200,
-				Delay: 200, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100},
+				Delay: 200, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100, Random: true},
 			{Name: "LAX", Code: "LAX", Port: 1002, Enabled: true, Fallback: true, TargetPort: 443,
 				TLS: true, IPNum: 20, Num: 5, ExpectCode: 200,
-				Delay: 300, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100},
+				Delay: 300, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100, Random: true},
 			{Name: "JP",  Code: "NRT", Port: 1003, Enabled: false, Fallback: true, TargetPort: 443,
 				TLS: true, IPNum: 20, Num: 5, ExpectCode: 200,
-				Delay: 250, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100},
+				Delay: 250, Domain: "cloudflaremirrors.com/debian", IPsType: "4", Task: 100, Random: true},
 		}
 		_ = m.db.SaveRegions(m.regions)
 	}

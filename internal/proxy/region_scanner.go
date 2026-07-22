@@ -89,7 +89,7 @@ func (m *Manager) regionScanLoop(ctx context.Context, r config.ProxyRegion) {
 // 生成 CF 随机候选 → TCP:80 探活拿 colo(CF-RAY) + 延迟（与 cfnat-docker scanIPs 同款探针）
 // → 按地区 colo 过滤 → 按延迟排序 → 写入热池
 func (m *Manager) scanRegionFallback(ctx context.Context, r config.ProxyRegion) {
-	candidates := m.genFallbackCandidates(r.IPsType)
+	candidates := m.genFallbackCandidates(r.IPsType, r.Random)
 	if len(candidates) == 0 {
 		return
 	}
@@ -297,9 +297,13 @@ func probeTraceVia443(ip string) (colo string, latMs int64, ok bool) {
 	return "", 0, false
 }
 
-// genFallbackCandidates 从 CF 全量 IP 段生成随机候选（每个 /24 抽 1 个，每次扫描刷新随机性）
-// 与 cfnat-docker 的 getRandomIPv4s 同口径。ipType="6" 时改用 IPv6 候选池。
-func (m *Manager) genFallbackCandidates(ipType string) []string {
+// genFallbackCandidates 从 CF 全量 IP 段生成候选，对齐 cfnat-docker 的 random 参数：
+//   - random=true（默认）：每个 /24 网段随机抽 1 个 IP（与 cfnat-docker getRandomIPv4s 同口径，
+//     随机范围 0..255 全量抽取，与 cfnat-docker 的 nextRandomIntn(256) 一致）
+//   - random=false：穷举 CIDR 内每一个 IP（与 cfnat-docker readIPs 的 CIDR 全展开同口径，极重）
+//
+// ipType="6" 时改用 IPv6 候选池（IPv6 全展开不可行，始终走随机抽样，与 cfnat-docker 行为一致）。
+func (m *Manager) genFallbackCandidates(ipType string, random bool) []string {
 	var cidrs []string
 	if ipType == "6" {
 		cidrs = fallbackCIDRs6
@@ -313,17 +317,31 @@ func (m *Manager) genFallbackCandidates(ipType string) []string {
 			continue
 		}
 		if ipnet.IP.To4() != nil {
-			// IPv4：拆 /24 后每个子网抽 1 个（与旧 cfnat 一致）
 			subs := expandToSlash24(ipnet)
 			for _, sub := range subs {
-				offset := uint32(rand.Intn(254)) + 1
-				ip := addOffset(sub.IP.To4(), offset)
-				if ip != nil {
-					out[ip.String()] = struct{}{}
+				base := sub.IP.To4()
+				if base == nil {
+					continue
+				}
+				if random {
+					// 对齐 cfnat-docker getRandomIPv4s：nextRandomIntn(256) → 0..255 全量随机
+					offset := uint32(rand.Intn(256))
+					ip := addOffset(base, offset)
+					if ip != nil {
+						out[ip.String()] = struct{}{}
+					}
+				} else {
+					// 对齐 cfnat-docker readIPs：穷举 /24 内所有主机（含网络/广播地址）
+					for off := 0; off <= 255; off++ {
+						ip := addOffset(base, uint32(off))
+						if ip != nil {
+							out[ip.String()] = struct{}{}
+						}
+					}
 				}
 			}
 		} else {
-			// IPv6：在大段内随机抽 ipv6SamplesPerCIDR 个地址
+			// IPv6：大段内随机抽 ipv6SamplesPerCIDR 个地址（全展开不可行，保持抽样）
 			for _, ip := range sampleIPv6(ipnet, ipv6SamplesPerCIDR) {
 				out[ip] = struct{}{}
 			}
