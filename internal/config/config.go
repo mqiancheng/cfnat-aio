@@ -73,6 +73,31 @@ func (r *ProxyRegion) UnmarshalJSON(data []byte) error {
 	if r.ExpectCode == 0 {
 		r.ExpectCode = 200
 	}
+	// 其余 cfnat 参数补齐 cfnat-docker 同款默认值（与 flag 默认值一致）：
+	// 旧数据或"添加地区"表单未提交的字段会以零值入库，这里在加载时补齐，
+	// 保证「存的是什么 = 用的是什么 = 页面显示的是什么」，杜绝 keep<=0→20
+	// 而后端扫描口径与表单显示不一致的问题。
+	if r.IPNum <= 0 {
+		r.IPNum = 20
+	}
+	if r.Num <= 0 {
+		r.Num = 5
+	}
+	if r.Delay <= 0 {
+		r.Delay = 300
+	}
+	if r.Task <= 0 {
+		r.Task = 100
+	}
+	if r.TargetPort <= 0 {
+		r.TargetPort = 443
+	}
+	if r.IPsType == "" {
+		r.IPsType = "4"
+	}
+	if r.Domain == "" {
+		r.Domain = "cloudflaremirrors.com/debian"
+	}
 	// random 默认 true（与 cfnat-docker 默认值一致）：仅当显式 false 时才穷举扫描。
 	// 旧数据若无 random 字段，统一视作 true，避免存量配置在升级后突变成全量穷举扫描。
 	if len(tmp.Random) == 0 || string(tmp.Random) == "null" {

@@ -58,6 +58,8 @@ func (m *Manager) StopRegionScanner(name string) {
 }
 
 // regionScanLoop 常驻循环：启动即扫一次，之后按间隔刷新热池
+// 重要：每次循环都从 m.regions 重新读取最新配置（而非使用启动时的快照 r），
+//       保证用户在 WebUI 修改 ipnum/delay/task 等参数后，下一轮扫描立即生效。
 func (m *Manager) regionScanLoop(ctx context.Context, r config.ProxyRegion) {
 	defer func() {
 		m.scanMu.Lock()
@@ -80,6 +82,10 @@ func (m *Manager) regionScanLoop(ctx context.Context, r config.ProxyRegion) {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			// 每次扫描前重新读取最新配置（WebUI 修改后下次循环即生效）
+			if live := m.liveRegion(r.Name); live != nil {
+				r = *live
+			}
 			m.scanRegionFallback(ctx, r)
 		}
 	}
@@ -169,10 +175,11 @@ func (m *Manager) scanRegionFallback(ctx context.Context, r config.ProxyRegion) 
 	m.mu.Lock()
 	// 兜底热池也做增量合并：保留旧池里仍低延迟的 IP，避免每次扫描整体覆盖导致的不稳定
 	m.fallbackPicks[r.Name] = mergePools(pool, m.fallbackPicks[r.Name], keep, "")
-	// 仅当该地区未开启"使用收藏IP"时，才把扫描结果推给监听器作为代理目标。
-	// 开启收藏IP时，扫描器只负责维持兜底热池（fallbackPicks）作为故障备份，
+	// 仅当该地区未开启"使用收藏IP"（或已因收藏全挂而落入兜底模式）时，
+	// 才把扫描结果推给监听器作为代理目标。
+	// 开启收藏IP且正在使用收藏IP时，扫描器只负责维持兜底热池（fallbackPicks）作为故障备份，
 	// 绝不覆盖 listener 当前正在使用的收藏IP（cfnat-docker 单实例无此冲突，AIO 需显式隔离）。
-	if l, ok := m.listeners[r.Name]; ok && !usePinned {
+	if l, ok := m.listeners[r.Name]; ok && (!usePinned || l.ipMgr.isFallback()) {
 		cur := l.ipMgr.getCurrentIP()
 		merged := mergePools(pool, l.ipMgr.getIPs(), keep, cur)
 		l.ipMgr.refresh(merged)

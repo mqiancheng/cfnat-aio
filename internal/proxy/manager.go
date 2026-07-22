@@ -150,6 +150,7 @@ type Manager struct {
 	running    bool
 	startedAt  time.Time
 	lastHealth map[string]time.Time // region -> 上次健康检查时间
+	lastRescan map[string]time.Time // region -> 上次兜底池重扫时间（防雪崩：短时间不重复扫）
 }
 
 // New 创建代理管理器
@@ -164,6 +165,7 @@ func New(store *config.SQLiteStore, lib *iplibrary.Library, cfgMgr *config.Manag
 		regionScanCancel: make(map[string]context.CancelFunc),
 		scanInterval:     10 * time.Minute,
 		lastHealth:       make(map[string]time.Time),
+		lastRescan:       make(map[string]time.Time),
 		startedAt:        time.Now(),
 	}
 	return m
@@ -392,7 +394,7 @@ func (im *ipManager) switchToNextValidIP(checkFn func(ip string) bool) bool {
 	}
 
 	im.allIPsChecked = true
-	logging.WarnTo("proxy", "所有 IP 都已轮过，触发兜底池")
+	logging.WarnTo("proxy", "所有 IP 都已轮过")
 	return false
 }
 
@@ -674,26 +676,11 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	// （currentIP 粘性，不再像之前那样在池内轮询不同 IP 导致连接乱跳）
 	upstream, err := m.dialBest(ctx, target, tp, r.Num, r.Delay)
 	if err != nil {
+		// 对齐 cfnat-docker handleConnection（cfnat.go:877-879）：拨号全部超时仅关闭
+		// 当前客户端连接，绝不在连接路径切换 IP——抖动由客户端重试吸收；
+		// 换 IP 只由后台健康检查在连续 2 次失败后触发（cfnat.go:797-804）。
 		logging.WarnTo("proxy", "%s: 连接 %s:%d 失败: %v", r.Name, target, tp, err)
 		_ = m.store.MarkIPChecked(target, r.Name, false, 0, 0)
-		if isFallback {
-			// 兜底 IP 挂了 → 切到池子里下一个（cfnat-docker 同款 switchToNextValidIP，遍历列表）
-			ok := rl.ipMgr.switchToNextValidIP(func(ip string) bool {
-				return m.checkValidIP(ip, rl.region)
-			})
-			if ok {
-				logging.WarnTo("proxy", "%s: 兜底 IP %s 失效，切换到 %s", r.Name, target, rl.ipMgr.getCurrentIP())
-			} else {
-				// 全部轮过 → 重新扫描兜底池（cfnat-docker 的 rescan 行为），重置到最优
-				logging.WarnTo("proxy", "%s: 兜底池所有 IP 已轮过，触发重新扫描", r.Name)
-				go m.scanRegionFallback(context.Background(), r)
-			}
-		} else {
-			// 收藏 IP 挂了 → 切到列表里的下一个
-			rl.ipMgr.switchToNextValidIP(func(ip string) bool {
-				return m.checkValidIP(ip, rl.region)
-			})
-		}
 		return
 	}
 	defer upstream.Close()
@@ -830,93 +817,15 @@ func (m *Manager) dialBest(ctx context.Context, target string, port, num, delayM
 	return nil, fmt.Errorf("dial %s failed", addr)
 }
 
-// 注意：AIO 严格保持 cfnat-docker 的切换逻辑 —— 只有自检(127.0.0.1:port)连续 2 次
-// 连不上时才切换 IP，没有任何"超延时就切"的功能。上面的 switchForDelay / ipUnderDelay
+// 注意：AIO 严格保持 cfnat-docker 的切换逻辑 —— 只有健康检查(127.0.0.1:port，读检测)
+// 连续 2 次失败才切换 IP（cfnat.go:797-804）；连接路径拨号失败只关闭当前连接、绝不换 IP
+// （cfnat.go:877-879），没有任何"超延时就切"的功能。之前的 switchForDelay / ipUnderDelay
 // / measureTargetLatency 等延迟切换逻辑已全部移除，切勿再自行添加。
-
-// pickBestLatencyIP 从候选 IP 中按 colo + 延迟筛选最优（与旧 cfnat 一致）
-//   - r.Code 非空时：只保留数据中心匹配的 IP（通过 CF-RAY 头识别）
-//   - 优先选低于 Delay 阈值的，无匹配则选 colo 匹配里延迟最低的
-//   - 完全无 colo 匹配时回退到全局最低延迟（避免选不到 IP）
-// 返回 (选中IP, 延迟毫秒)
-func (m *Manager) pickBestLatencyIP(candidates []string, r config.ProxyRegion) (string, int64) {
-	if len(candidates) <= 1 {
-		ip, _ := m.lib.PickFallback(candidates)
-		return ip, 0
-	}
-	// 限制参与探测的候选数，避免首次选择阻塞过久
-	const maxProbe = 3000
-	probes := candidates
-	if len(probes) > maxProbe {
-		probes = probes[:maxProbe]
-	}
-	threshold := time.Duration(r.Delay) * time.Millisecond
-
-	sem := make(chan struct{}, 400)
-	type probe struct {
-		ip   string
-		lat  time.Duration
-		colo string
-	}
-	ch := make(chan probe, len(probes))
-	for _, ip := range probes {
-		sem <- struct{}{}
-		go func(addr string) {
-			defer func() { <-sem }()
-			colo, lat := m.detectColo(addr)
-			ch <- probe{addr, lat, colo}
-		}(ip)
-	}
-
-	var matchedAll []probe    // colo 匹配（r.Code 为空则全部算匹配）
-	var matchedThresh []probe // colo 匹配且延迟达标
-	lowest := probe{lat: -1}  // 全局最低延迟（回退用），-1 表示尚未有有效值
-	for range probes {
-		p := <-ch
-		if p.lat < 0 {
-			continue
-		}
-		coloOK := r.Code == "" || strings.EqualFold(p.colo, r.Code)
-		if coloOK {
-			matchedAll = append(matchedAll, p)
-			if threshold <= 0 || p.lat <= threshold {
-				matchedThresh = append(matchedThresh, p)
-			}
-		}
-		if lowest.lat < 0 || p.lat < lowest.lat {
-			lowest = p
-		}
-	}
-
-	// 优先阈值内匹配，其次 colo 匹配，最后全局最低
-	pool := matchedThresh
-	if len(pool) == 0 {
-		pool = matchedAll
-	}
-	if len(pool) > 0 {
-		best := pool[0]
-		for _, p := range pool {
-			if p.lat < best.lat {
-				best = p
-			}
-		}
-		if len(matchedThresh) > 0 {
-			logging.InfoTo("proxy", "%s: 兜底池优选 IP = %s（colo=%s, 延迟 %dms ≤ 阈值 %dms，匹配 %d 个）",
-				r.Name, best.ip, best.colo, best.lat.Milliseconds(), r.Delay, len(matchedAll))
-		} else {
-			logging.WarnTo("proxy", "%s: 无 %s 的 IP 低于 %dms（colo=%s 最低 %dms），使用 colo 匹配最低",
-				r.Name, r.Code, r.Delay, best.colo, best.lat.Milliseconds())
-		}
-		return best.ip, best.lat.Milliseconds()
-	}
-	if lowest.lat >= 0 {
-		logging.WarnTo("proxy", "%s: 无 %s colo 的 IP（最低 %dms 来自 %s），回退全局最低延迟 IP",
-			r.Name, r.Code, lowest.lat.Milliseconds(), lowest.colo)
-		return lowest.ip, lowest.lat.Milliseconds()
-	}
-	ip, _ := m.lib.PickFallback(candidates)
-	return ip, 0
-}
+//
+// 重要：cfnat-docker 的 delay 仅作「代理拨号超时」(handleConnection 的 DialTimeout)
+// 与「自检拨号超时」(statusCheck 的 DialTimeout)，【扫描/选池阶段绝不按 delay 过滤】。
+// 因此 AIO 也不在扫描期对 IP 池做任何延迟阈值过滤——任何"低于 Delay 才保留"的逻辑
+// 都是与 cfnat-docker 不符的错误实现，切勿再加回来。
 
 // detectColo 通过 TCP 连接到 :80 读取 CF-RAY 头识别数据中心代码
 // 延迟仅测量 TCP 握手时间（与旧 cfnat scanIPs 第764-771行一致），不含 HTTP 往返
@@ -955,10 +864,10 @@ func (m *Manager) detectColo(ip string) (string, time.Duration) {
 	return parts[len(parts)-1], tcpLat
 }
 
-// statusCheckLoop 后台健康检查循环（移植自 cfnat-docker）
-// 定时连接自己的 127.0.0.1:port 验证端口可用
-// 失败则触发 switchToNextValidIP 切换 IP
-// 每隔几个周期还会对当前 IP 做 detectColo 刷新延迟值（用于仪表盘展示）
+// statusCheckLoop 后台健康检查循环（移植自 cfnat-docker statusCheck）
+// 定时连接自己的 127.0.0.1:port 并做读检测（能感知上游 currentIP 死活，cfnat.go:743-789），
+// 连续 2 次失败才切换 IP（cfnat.go:797-804）；连接路径绝不切换（cfnat.go:877-879）。
+// 每隔几个周期还会刷新当前 IP 的延迟值（用于仪表盘展示）
 func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl *regionListener) {
 	_, localPort, _ := net.SplitHostPort(fmt.Sprintf(":%d", r.Port))
 	checkAddr := fmt.Sprintf("127.0.0.1:%s", localPort)
@@ -980,28 +889,23 @@ func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl 
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			if !m.doStatusCheck(checkAddr, r) {
-				// 对齐 cfnat-docker：需连续 2 次失败才切换（容忍单次抖动），
-				// 单次失败只计数不动作，避免端口瞬断导致频繁换 IP。
-				streak := rl.failStreak.Add(1)
-				if streak >= 2 {
-					rl.failStreak.Store(0)
-					if rl.ipMgr.isFallback() {
-						// 兜底 IP 连续失效 → 清空 currentIP，下次连接重新选
-						rl.ipMgr.clearCurrent()
-						logging.WarnTo("proxy", "%s: 兜底 IP 连续2次失效，下次重选", r.Name)
-					} else if !rl.ipMgr.switchToNextValidIP(func(ip string) bool {
-						return m.checkValidIP(ip, r)
-					}) {
-						// 收藏 IP 全部轮过 → 清空 currentIP 让 pickTarget 走兜底
-						rl.ipMgr.clearCurrent()
-						logging.WarnTo("proxy", "%s 所有收藏 IP 都已耗尽，将走兜底池", r.Name)
-					}
-				} else {
-					logging.WarnTo("proxy", "%s: 单次健康检查失败（%d/2），暂不切换", r.Name, streak)
-				}
-			} else {
+			if rl.ipMgr.getCurrentIP() == "" {
+				// 尚未选出 IP（首次扫描进行中 / 已耗尽等重扫）：无 IP 可判死，
+				// 不计失败不切换（cfnat-docker 扫完才接客，永远不会处于此状态）
 				rl.failStreak.Store(0)
+			} else if m.doStatusCheck(checkAddr, r) {
+				rl.failStreak.Store(0)
+			} else {
+				// 对齐 cfnat-docker statusCheck：需连续 2 次失败才切换（容忍单次抖动），
+				// 单次失败只计数不动作（cfnat.go:735-795）
+				streak := rl.failStreak.Add(1)
+				if streak < 2 {
+					logging.WarnTo("proxy", "%s: 单次健康检查失败（%d/2），暂不切换", r.Name, streak)
+				} else {
+					rl.failStreak.Store(0)
+					logging.WarnTo("proxy", "%s: 连续两次状态检查失败，切换到下一个 IP", r.Name)
+					m.switchRegionIP(r, rl)
+				}
 			}
 			m.mu.Lock()
 			m.lastHealth[r.Name] = time.Now()
@@ -1022,15 +926,101 @@ func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl 
 	}
 }
 
-// doStatusCheck 单次自检：连接 127.0.0.1:port 看端口是否还通
+// switchRegionIP 连续 2 次健康检查失败后的切换动作（对齐 cfnat.go:797-804 的
+// switchToNextValidIP + allIPsChecked → done → 主循环重扫 cfnat.go:340-347）：
+//   - 顺序切到当前列表下一个有效 IP（收藏/兜底同一套，与 docker 单一列表一致）
+//   - 收藏列表耗尽 → 换用常驻扫描维护的兜底热池
+//   - 兜底池耗尽 → 触发重扫（60s 冷却防雪崩）
+func (m *Manager) switchRegionIP(r config.ProxyRegion, rl *regionListener) {
+	if rl.ipMgr.switchToNextValidIP(func(ip string) bool {
+		return m.checkValidIP(ip, r)
+	}) {
+		return
+	}
+	if rl.ipMgr.isFallback() {
+		logging.WarnTo("proxy", "%s: 兜底池所有 IP 已轮过，触发重新扫描", r.Name)
+		m.triggerFallbackRescan(r)
+		return
+	}
+	// 收藏 IP 全部轮过 → 换用兜底热池（与 use_pinned=false 时同池，已按 colo 筛选+延迟排序）
+	m.mu.Lock()
+	pool := m.fallbackPicks[r.Name]
+	m.mu.Unlock()
+	if len(pool) > 0 {
+		rl.ipMgr.refresh(pool)
+		rl.ipMgr.markFallback()
+		logging.WarnTo("proxy", "%s 所有收藏 IP 都已耗尽，切入兜底池（%d 个候选）", r.Name, len(pool))
+		return
+	}
+	rl.ipMgr.clearCurrent()
+	logging.WarnTo("proxy", "%s 所有收藏 IP 都已耗尽且兜底池未就绪，触发重新扫描", r.Name)
+	m.triggerFallbackRescan(r)
+}
+
+// triggerFallbackRescan 触发一次兜底池重扫（对齐 cfnat-docker 主循环重扫），
+// 60s 冷却防雪崩：本地网络不通时池内 IP 全 timeout 会反复触发重扫导致 CPU/网络打满。
+func (m *Manager) triggerFallbackRescan(r config.ProxyRegion) {
+	const rescanCooldown = 60 * time.Second
+	m.mu.Lock()
+	last := m.lastRescan[r.Name]
+	since := time.Since(last)
+	if since < rescanCooldown {
+		m.mu.Unlock()
+		logging.WarnTo("proxy", "%s: 距上次重扫仅 %.0fs（冷却 %ds），跳过重扫",
+			r.Name, since.Seconds(), int(rescanCooldown.Seconds()))
+		return
+	}
+	m.lastRescan[r.Name] = time.Now()
+	m.mu.Unlock()
+	go m.scanRegionFallback(context.Background(), r)
+}
+
+// doStatusCheck 单次自检（移植 cfnat-docker statusCheck 的读检测，cfnat.go:743-789）：
+// 连接 127.0.0.1:port 后尝试读数据——
+//   - 上游 currentIP 拨号成功：代理管道建立，CF 不会主动发数据 → 读超时 = 正常
+//   - 上游拨号失败：handleConn 直接关闭连接 → 读到 EOF = 失败
+//
+// 因此它能感知上游死活，而非仅验证本机端口在监听。
+// 超时对齐 cfnat-docker：用本地区 delay 当拨号/读超时（cfnat.go:743,755）。
 func (m *Manager) doStatusCheck(checkAddr string, r config.ProxyRegion) bool {
-	conn, err := net.DialTimeout("tcp", checkAddr, 2*time.Second)
+	timeout := time.Duration(r.Delay) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 2 * time.Second // delay 未配置时给保底值，避免自检永远超时
+	}
+	conn, err := net.DialTimeout("tcp", checkAddr, timeout)
 	if err != nil {
 		logging.WarnTo("proxy", "%s statusCheck 失败: %v", r.Name, err)
 		return false
 	}
-	conn.Close()
-	return true
+	defer conn.Close()
+
+	checkSuccess := make(chan bool, 1)
+	go func() {
+		reader := bufio.NewReader(conn)
+		conn.SetReadDeadline(time.Now().Add(timeout + 1*time.Second))
+		_, err := reader.ReadString('\n')
+		if err != nil {
+			if err == io.EOF {
+				checkSuccess <- false // 服务端断开：上游拨号失败
+			} else if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				checkSuccess <- true // 超时说明连接保持正常（上游管道建立）
+			} else {
+				checkSuccess <- false
+			}
+		} else {
+			checkSuccess <- true
+		}
+	}()
+
+	select {
+	case success := <-checkSuccess:
+		if !success {
+			logging.WarnTo("proxy", "%s statusCheck 失败: 服务端断开连接（上游不可达）", r.Name)
+		}
+		return success
+	case <-time.After(timeout + 2*time.Second):
+		return true // 连接保持稳定
+	}
 }
 
 // refreshCurrentDelay 对当前 IP 做 detectColo 刷新延迟（用于仪表盘展示）
