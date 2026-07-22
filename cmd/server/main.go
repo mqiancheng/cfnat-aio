@@ -54,6 +54,10 @@ func main() {
 		log.Fatalf("打开 SQLite 失败: %v", err)
 	}
 	defer db.Close()
+	// 单连接串行化所有读写：写入来自多个 goroutine（导入探测/代理自检/扫描入库），
+	// 连接池多连接并发写在 WAL 下仍可能瞬间 SQLITE_BUSY（busy_timeout 对读升级写无效），
+	// 导致批量导入时丢 IP。本地工具写量极小，单连接彻底消除 database is locked。
+	db.SetMaxOpenConns(1)
 
 	// 初始化各模块
 	store, err := config.NewSQLiteStore(db)

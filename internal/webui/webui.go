@@ -498,8 +498,14 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 
+	// SSE 写锁：所有探测 goroutine 并发调用 sse，http.ResponseWriter 不支持并发写，
+	// 裸写会交叉破坏 HTTP chunk 帧，浏览器 fetch 直接报 "network error" 中断整条流，
+	// 前端于是把所有未完成 IP 标成失败（"N 有效 / M 失败"全是误报）
+	var sseMu sync.Mutex
 	sse := func(event string, data interface{}) {
 		b, _ := json.Marshal(data)
+		sseMu.Lock()
+		defer sseMu.Unlock()
 		fmt.Fprintf(w, "event: %s\ndata: %s\n\n", event, string(b))
 		flusher.Flush()
 	}
@@ -601,33 +607,40 @@ func (h *Handlers) HandleAPIIPImportProbe(w http.ResponseWriter, r *http.Request
 			cmin2Count++
 			mu.Unlock()
 
-			// CMIN2 节点：立即入库（不等待测速结果，避免因网络抖动丢失可用 IP）
-			// 测速仅用于记录/展示，不阻塞入库
-			importSpeed := 0.0
-			if req.AutoImport {
-				if err := h.Lib.AddIP(t.ip, res.Colo, "import", res.Colo, importSpeed, res.Latency, t.note); err == nil {
-					sse("imported", map[string]interface{}{"ip": t.ip})
-					mu.Lock()
-					imported++
-					mu.Unlock()
-				}
+		// CMIN2 节点：先测速，达标（>= min_speed）才入库——min_speed_mbps 是入库门槛，
+		// 未达标的慢节点不进库（此前"先入库后测速"会让低于门槛的 IP 留在库里）
+		sse("speedstart", map[string]interface{}{"ip": t.ip})
+		mbps, _ := h.Scanner.MeasureSpeed(t.ip, speedURL, sc.Port, speedSec)
+		passed := mbps >= minSpeed
+		reason := ""
+		if !passed {
+			if mbps <= 0 {
+				reason = "测速失败或无数据"
+			} else {
+				reason = fmt.Sprintf("测速 %.1fMB/s 低于门槛 %.1fMB/s", mbps, minSpeed)
 			}
+		}
+		if passed {
+			mu.Lock()
+			speedPassed++
+			mu.Unlock()
+		}
 
-			// 测速（异步记录，结果更新到已入库的 IP）
-			sse("speedstart", map[string]interface{}{"ip": t.ip})
-			mbps, _ := h.Scanner.MeasureSpeed(t.ip, speedURL, sc.Port, speedSec)
-			passed := mbps >= minSpeed
-			// 即使测速未达标也标记为 ok（IP 已通过 CMIN2 探测并入库），仅区分"有速度值"和"无速度值"
-			sse("speed", map[string]interface{}{"ip": t.ip, "speed_mbps": mbps, "passed": true, "imported": req.AutoImport})
-			if passed {
+		didImport := false
+		if passed && req.AutoImport {
+			if err := h.Lib.AddIP(t.ip, res.Colo, "import", res.Colo, mbps, res.Latency, t.note); err == nil {
+				sse("imported", map[string]interface{}{"ip": t.ip})
 				mu.Lock()
-				speedPassed++
+				imported++
 				mu.Unlock()
+				didImport = true
 			}
-			// 有有效测速数据时回写速度到 DB（Upsert 更新已有记录）
-			if mbps > 0 {
-				_ = h.Lib.UpdateSpeed(t.ip, res.Colo, mbps, res.Latency)
-			}
+		}
+		sse("speed", map[string]interface{}{"ip": t.ip, "speed_mbps": mbps, "passed": passed, "imported": didImport, "reason": reason})
+		// 已在库中的 IP：回写最新测速数据（只是记录，不影响入库门槛判定）
+		if mbps > 0 {
+			_ = h.Lib.UpdateSpeed(t.ip, res.Colo, mbps, res.Latency)
+		}
 		}(t)
 	}
 	wg.Wait()
