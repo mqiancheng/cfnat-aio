@@ -36,11 +36,16 @@ import (
 	"cfnat-aio/internal/logging"
 )
 
-// 全量 CF IPv4 兜底池（与旧 cfnat 一致：完整 /24 列表，每个抽随机 IP）
-// 来源：https://www.baipiao.eu.org/cloudflare/ips-v4
+// 全量 CF IPv4 兜底池（与 cfnat-docker 的 ips-v4.txt(baipiao 源) 对齐：完整 /24 列表，每个抽随机 IP）
+// 前 15 条 = CF 官方段（https://www.cloudflare.com/ips-v4，展开 5956 个 /24）；
+// 后 3 条 = baipiao 源有而官方未列的缺口：
+//   - 104.28.0.0/14：CF 主力段 104.16.0.0/12 的另一半（1024 个 /24，与 104.16-104.27 同级）
+//   - 1.0.0.0/24 + 1.1.1.0/24：CF DNS anycast 段（docker 每轮约 6.8% 候选落在这两段）
+// baipiao 源其余杂段（8.x/海外 partner 段）对国内代理价值低，不收录；
+// 用户自收集的非公开段（fofa 等渠道，时效性差）不入代码，走 IP 库收藏。
 var fallbackCIDRs = []string{
 	"103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22",
-	"104.16.0.0/13", "104.24.0.0/14",
+	"104.16.0.0/13", "104.24.0.0/14", "104.28.0.0/14",
 	"108.162.192.0/18",
 	"131.0.72.0/22",
 	"141.101.64.0/18",
@@ -51,6 +56,7 @@ var fallbackCIDRs = []string{
 	"190.93.240.0/20",
 	"197.234.240.0/22",
 	"198.41.128.0/17",
+	"1.0.0.0/24", "1.1.1.0/24",
 }
 
 // 全量 CF IPv6 兜底池（IP 类型=6 时使用）
@@ -382,14 +388,20 @@ func (im *ipManager) refresh(ips []string) {
 	im.allIPsChecked = false
 	// 如果当前 currentIP 不在新列表里 → 清空（但不改变 fallbackMode）
 	found := false
-	for i, x := range ips {
+	for _, x := range ips {
 		if x == im.currentIP {
-			im.currentIndex = i
 			found = true
 			break
 		}
 	}
-	if !found {
+	if found {
+		// 换池后切换扫描从池头开始（对齐 cfnat-docker：SetIPAddresses 后 currentIndex=0、
+		// selectValidIP 从池头遍历选人）。绝不能把 currentIndex 定位到 currentIP 所在索引——
+		// mergePools 会把粘性 IP 强制保留在池尾，定位到池尾后 switchToNextValidIP 从 尾+1
+		// 开始零执行，池内新马全部够不到，形成"死马占坑→轮完→重扫→还是它"的死循环
+		//（2026-07-23 LAX 实例：172.67.226.105 卡死 10 分钟无法换出）
+		im.currentIndex = -1
+	} else {
 		im.currentIP = ""
 		im.currentIndex = 0
 		im.currentDelayMs = 0
@@ -728,9 +740,6 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	if tp <= 0 {
 		tp = 443
 	}
-	logging.InfoTo("proxy", "%s: %s → %s:%d (%s)", r.Name,
-		client.RemoteAddr().String(),
-		target, tp, src)
 
 	// 对齐 cfnat-docker：以当前 currentIP 为目标，并发拨 num 份，
 	// 用 r.Delay 当拨号超时（超过阈值的握手直接掐掉），并取延迟最低的那个用于转发。
@@ -752,6 +761,14 @@ func (m *Manager) handleConn(ctx context.Context, client net.Conn, r config.Prox
 	if _, err := io.ReadFull(client, firstByte); err != nil {
 		return
 	}
+
+	// 转发日志在「读到首字节」之后才打印：健康检查自连（doStatusCheck 只读不写、
+	// 永远等不到首字节）由此完全静默，每 2 秒一条的自连转发日志不再刷屏；
+	// 真实客户端（VLESS/SOCKS5/CONNECT 均为客户端先说话）不受影响。
+	// 失败路径日志（拨号失败/statusCheck 失败/切换）全部保留。
+	logging.InfoTo("proxy", "%s: %s → %s:%d (%s)", r.Name,
+		client.RemoteAddr().String(),
+		target, tp, src)
 
 	switch {
 	case firstByte[0] == 0x05:
@@ -933,17 +950,19 @@ func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl 
 	_, localPort, _ := net.SplitHostPort(fmt.Sprintf(":%d", r.Port))
 	checkAddr := fmt.Sprintf("127.0.0.1:%s", localPort)
 
-	// 给一个初始延迟
+	// 给一个初始延迟（currentIP 为空时不计失败，无需长等）
 	select {
 	case <-ctx.Done():
 		return
-	case <-time.After(10 * time.Second):
+	case <-time.After(2 * time.Second):
 	}
 
-	ticker := time.NewTicker(8 * time.Second)
+	// 对齐 cfnat-docker statusCheck（cfnat.go:735）：每 2 秒一轮
+	//（此前 8s 是 AIO 自定值，坏网络下换血速度只有 docker 的 1/4）
+	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
-	delayCheckTick := 0 // 计数器：每 4 次健康检查（约 32s）测一次延迟
+	delayCheckTick := 0 // 计数器：每 16 次健康检查（约 32s）测一次延迟
 
 	for {
 		select {
@@ -978,12 +997,12 @@ func (m *Manager) statusCheckLoop(ctx context.Context, r config.ProxyRegion, rl 
 			m.lastHealth[r.Name] = time.Now()
 			m.mu.Unlock()
 
-		// 周期性刷新当前 IP 的延迟（每 ~32 秒一次）
-		delayCheckTick++
-		if delayCheckTick >= 4 {
-			delayCheckTick = 0
-			m.refreshCurrentDelay(rl, r)
-		}
+	// 周期性刷新当前 IP 的延迟（每 ~32 秒一次）
+	delayCheckTick++
+	if delayCheckTick >= 16 {
+		delayCheckTick = 0
+		m.refreshCurrentDelay(rl, r)
+	}
 
 		// 持久化当前使用的 IP（重启记忆）：关闭程序后可优先复用，秒级可用
 		if cur := rl.ipMgr.getCurrentIP(); cur != "" {
@@ -1037,6 +1056,10 @@ func (m *Manager) triggerFallbackRescan(r config.ProxyRegion) {
 			r.Name, since.Seconds(), int(rescanCooldown.Seconds()))
 		return
 	}
+	// 整表替换（对齐 cfnat-docker rescan）：耗尽重扫不 merge 旧池——
+	// 旧池全是已被轮毙的差马，merge 会让它们继续占坑（周期扫描的 merge 是保护粘性 IP 的，
+	// 场景不同）；清空后本次扫描结果全新替换（mergePools 仍会强制保留 currentIP）
+	m.fallbackPicks[r.Name] = nil
 	m.lastRescan[r.Name] = time.Now()
 	m.mu.Unlock()
 	// 读实时配置再扫：ipnum/task/random 热更新后，触发型重扫同样用最新参数
