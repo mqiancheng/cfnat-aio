@@ -31,6 +31,8 @@ WORKDIR /data
 
 EXPOSE 1234
 
-# 默认参数可通过 docker run -e 或 compose environment 覆盖
+# 端口不在镜像层硬编码：-port 缺省为 0 = 使用数据库配置（WebUI 设置项）。
+# 若在此显式传 -port，main.go 会每次启动覆盖并回写数据库配置，
+# 导致 WebUI 里的端口修改在重建容器后永远被冲回（2026-07-24 用户实测踩坑）。
 ENTRYPOINT ["/usr/local/bin/cfnat-aio"]
-CMD ["-port", "1234"]
+CMD []
