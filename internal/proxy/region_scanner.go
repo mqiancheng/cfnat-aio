@@ -330,7 +330,7 @@ func (m *Manager) genFallbackCandidates(ipType string, random bool) []string {
 				if base == nil {
 					continue
 				}
-				if random {
+				if random && !fallbackExhaustSlash24[c] {
 					// 对齐 cfnat-docker getRandomIPv4s：nextRandomIntn(256) → 0..255 全量随机
 					offset := uint32(rand.Intn(256))
 					ip := addOffset(base, offset)
@@ -338,7 +338,9 @@ func (m *Manager) genFallbackCandidates(ipType string, random bool) []string {
 						out[ip.String()] = struct{}{}
 					}
 				} else {
-					// 对齐 cfnat-docker readIPs：穷举 /24 内所有主机（含网络/广播地址）
+					// 对齐 cfnat-docker readIPs：穷举 /24 内所有主机（含网络/广播地址）；
+					// fallbackExhaustSlash24 段（1.0.0.0/1.1.1.0 DNS anycast）random=true 时也全量——
+					// docker 的 ips-v4.txt 里这两段是 512 行单 IP，每轮全量进候选
 					for off := 0; off <= 255; off++ {
 						ip := addOffset(base, uint32(off))
 						if ip != nil {
